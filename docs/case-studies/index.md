@@ -17,5 +17,4 @@ These pages check real open-source projects on the platforms their build configu
 - [Litestar: two documentation-only source builds on Python 3.14](litestar.md)
 - [FastMCP: optional and development pins on Python 3.15](fastmcp.md)
 - [Pydantic AI: a whole-lock audit with online metadata](pydantic-ai.md)
-
-- [MCP Python SDK: dependency wheel availability across Python 3.11–3.15 on Linux and Windows](mcp-python-sdk.md)
+- [MCP Python SDK: one runtime gap and four in its development groups](mcp-python-sdk.md)

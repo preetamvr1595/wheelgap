@@ -13,6 +13,12 @@
 
 The SDK's `.github/workflows/shared.yml` defines a CI matrix for Python 3.11–3.15 on `ubuntu-latest` and `windows-latest`. The wheelgap targets above represent Linux x86-64 and Windows x86-64 respectively. The SDK's `pyproject.toml` also declares `requires-python = ">=3.11"` and Python classifiers for 3.11 through 3.15. The workflow and project configuration were checked at the SDK commit listed above.
 
+## Input and selection
+
+The scan uses no `--group`, `--extra` or `--no-dev` flags, so it checks the whole lock: `mcp`'s runtime dependencies and extras, its default dependency groups (`dev` and `docs`), and the opt-in `translate` and `codegen` groups. CI's test job runs `uv sync --all-extras`, which installs the runtime dependencies, every extra and the default groups, but not `translate` or `codegen`. So a gap below that comes only through `translate` is in the lock but not in what CI installs. Each gap below names the group it comes through.
+
+CI's matrix also has a `lowest-direct` leg (`uv sync --upgrade --resolution lowest-direct`), which resolves fresh instead of using the lock. A lockfile check can't model that leg, so this study covers only the `locked` leg.
+
 ## Scan summary
 
 The scan examined 120 packages from the package index across 10 Python/platform combinations (five Python versions on two platforms).
@@ -26,11 +32,13 @@ A `source` result means wheelgap did not find a compatible published wheel for t
 
 ## Gaps and `--explain --suggest` findings
 
-The excerpts below reproduce the relevant `--explain --suggest` output from the scan. The scanner's suggestions are candidate versions with wheels for the listed targets; they are not automatic upgrades or proof of application compatibility. Any dependency change should be re-resolved and tested by the project.
+The excerpts below are from the `--explain --suggest` output, trimmed: `…` marks rejected-wheel lines left out, so the shown lines and wheelgap's own "and N more" don't add up to every file. The scanner's suggestions are candidate versions with wheels for the listed targets; they are not automatic upgrades or proof of application compatibility. Any dependency change should be re-resolved and tested by the project.
 
 ### 1. `cffi==2.0.0`
 
 **Affected targets:** Python 3.15 on Linux x86-64 and Windows x86-64.
+
+**Group:** runtime. `mcp` depends on `pyjwt[crypto]`, which brings in `cryptography` and then `cffi` on every target; on Windows the `dev` group's `trio` also needs it.
 
 Dependency paths reported:
 - Linux: `mcp → pyjwt → cryptography → cffi`
@@ -70,7 +78,7 @@ cffi 2.0.0 -> 2.1.0 has wheels for 3.15 linux-x86_64, 3.15 win-amd64
 
 **Affected targets:** Python 3.11, 3.12, 3.13, 3.14, and 3.15 on both Linux x86-64 and Windows x86-64 (all 10 targets).
 
-Dependency path reported: `mcp → blockbuster → forbiddenfruit`.
+**Group:** `dev` (default group; not a runtime dependency of `mcp`). Dependency path reported: `mcp → blockbuster → forbiddenfruit`.
 
 ```text
 forbiddenfruit 0.1.4 on 3.11 linux-x86_64: source
@@ -122,7 +130,7 @@ forbiddenfruit 0.1.4: no newer release has a wheel for 3.11 linux-x86_64, 3.11 w
 
 **Affected targets:** Python 3.15 on Linux x86-64 and Windows x86-64.
 
-Dependency path reported: `mcp → anthropic → jiter`.
+**Group:** `translate` (opt-in group; not a runtime dependency of `mcp`, and CI's `uv sync --all-extras` doesn't install it). Dependency path reported: `mcp → anthropic → jiter`.
 
 ```text
 jiter 0.16.0 on 3.15 linux-x86_64: source
@@ -154,7 +162,7 @@ jiter 0.16.0 -> 0.17.0 has wheels for 3.15 linux-x86_64, 3.15 win-amd64
 
 **Affected targets:** Python 3.14 and 3.15 on Linux x86-64 and Windows x86-64.
 
-Dependency path reported: `mcp → mkdocstrings → markupsafe`.
+**Group:** `docs` (default group; not a runtime dependency of `mcp`). Dependency path reported: `mcp → mkdocstrings → markupsafe`.
 
 ```text
 markupsafe 3.0.2 on 3.14 linux-x86_64: source
@@ -202,7 +210,7 @@ markupsafe 3.0.2 -> 3.0.4 has wheels for 3.14 linux-x86_64, 3.14 win-amd64, 3.15
 
 **Affected targets:** Python 3.14 and 3.15 on Linux x86-64 and Windows x86-64.
 
-Dependency path reported: `mcp → pyyaml`.
+**Group:** `docs` (default group; not a runtime dependency of `mcp`). Dependency path reported: `mcp → pyyaml`.
 
 ```text
 pyyaml 6.0.2 on 3.14 linux-x86_64: source
@@ -245,6 +253,7 @@ pyyaml 6.0.2: no newer release has a wheel for 3.15 linux-x86_64, 3.15 win-amd64
 
 ## Notes and limitations
 
+- Only `cffi` is a runtime dependency of `mcp`; the other gaps come through its development, documentation and translation groups, so they affect contributors and CI rather than users who `pip install mcp`.
 - These findings describe wheel availability for the versions recorded in this lock file and the selected targets on the scan date. They are not a claim that the SDK cannot install or run on those targets.
 - A missing wheel means installation may need a source build. Whether that succeeds depends on the package, build tooling, compiler availability, and platform environment.
 - The `--suggest` versions are wheel-availability candidates only. Confirm version constraints, runtime compatibility, and tests before adopting them.
@@ -252,11 +261,17 @@ pyyaml 6.0.2: no newer release has a wheel for 3.15 linux-x86_64, 3.15 win-amd64
 
 ## Reproduction
 
-From the SDK repository, the scan was run with wheelgap 0.13.0 against the committed lock file:
+Download the pinned input files into an empty directory and run wheelgap 0.13.0 on them:
 
-```powershell
-py -3.13 -m uv tool run --from wheelgap==0.13.0 wheelgap uv.lock -p 3.11,3.12,3.13,3.14,3.15 -t linux-x86_64,win-amd64 --explain --suggest
+```bash
+curl -fL https://raw.githubusercontent.com/modelcontextprotocol/python-sdk/77001c96f9507be0f4d009b83210a384a5e08bda/uv.lock -o uv.lock
+curl -fL https://raw.githubusercontent.com/modelcontextprotocol/python-sdk/77001c96f9507be0f4d009b83210a384a5e08bda/pyproject.toml -o pyproject.toml
+uvx --from wheelgap==0.13.0 python -m wheelgap uv.lock \
+  -p 3.11,3.12,3.13,3.14,3.15 -t linux-x86_64,win-amd64 \
+  --explain --suggest --no-cache
 ```
+
+Linux is modelled as x86-64 with glibc 2.36, wheelgap's default floor. With gaps reported, the scan exits 1.
 
 ## References
 
