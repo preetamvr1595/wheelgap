@@ -7,7 +7,7 @@ when the check ran; new uploads and lockfile updates can change them.
 
 ## Summary
 
-The fifteen studies below were scanned between 15 and 20 November 2026. Each result is for the pinned commit its page
+The sixteen studies below were scanned between 15 and 20 November 2026. Each result is for the pinned commit its page
 names and for wheelgap 0.13.0, except the mitmproxy study, which used wheelgap 0.10.0. A project, or a package it
 depends on, may have changed since.
 
@@ -28,6 +28,7 @@ depends on, may have changed since.
 | [Litestar](litestar.md) | Python 3.14; Linux, macOS, Windows; what CI's `uv sync` installs (214 rows) | 3 source builds | autodocsumm 0.2.6 and sphinx-paramlinks 0.6.0, both in the `docs` group, are sdist only; autodocsumm 0.2.8 has a wheel. autobahn 26.11.1's macOS arm64 wheels are tagged `macosx_15_0`, newer than the 14.0 floor; with `--macos 15.0` it is a wheel |
 | [FastMCP](fastmcp.md) | Python 3.15; Linux; the whole lock, which is also what CI installs (151 rows) | 5 source builds | jiter 0.16.0, msgspec 0.21.1, pyinstrument 5.1.2 and PyYAML 6.0.3 have wheels up to CPython 3.14 only; jiter 0.17.0 and msgspec 0.22.0 have 3.15 wheels. pytest-report 0.2.1 is sdist only |
 | [Pydantic AI](pydantic-ai.md) | Python 3.15; Linux; the whole lock with `--online` (370 rows) | 6 source builds and 2 missing in the report; 5 source builds in a uv install | forbiddenfruit 0.1.4 is sdist only; orjson 3.12.0's CPython 3.15 wheel is tagged `manylinux_2_39`; pandas 2.3.3, pymongo 4.18.3 and PyYAML 6.0.3 have wheels up to CPython 3.14 only, and pandas 3.0.6 and pymongo 4.19.0 have 3.15 wheels. The report's other three rows are not gaps for a uv install on 3.15: uv installs agent-client-protocol 0.11.1, and the lock doesn't select numpy 2.2.6 or onnxruntime 1.30.0 there |
+| [MCP Python SDK](mcp-python-sdk.md) | Python 3.11 to 3.15; Linux, Windows; the whole lock (120 packages) | 5 source builds: 1 on every Python, 3 on 3.14 and 5 on 3.15 | cffi 2.0.0, the only gap in the runtime dependencies, has no CPython 3.15 wheel; 2.1.0 does. forbiddenfruit 0.1.4 (`dev` group) is sdist only and is the newest release. MarkupSafe 3.0.2 and PyYAML 6.0.2 (`docs` group) have wheels up to CPython 3.13 only; MarkupSafe 3.0.4 has 3.14 and 3.15 wheels, and PyYAML 6.0.3 has a 3.14 wheel but no release has a 3.15 one. jiter 0.16.0 (the opt-in `translate` group, which the CI test job doesn't install) has wheels up to CPython 3.14 only; 0.17.0 has 3.15 wheels |
 
 Unless a row says otherwise, Linux is `linux-x86_64` with a glibc 2.36 floor, Windows is `win-amd64`, and macOS is
 `macos-arm64` with a macOS 14.0 floor. A source build means the pinned version has an sdist but no wheel that fits the
@@ -40,17 +41,25 @@ These packages are a gap in more than one study:
 
 - **PyYAML 6.0.3** has no CPython 3.15 wheel, and the studies found no newer release with one. Six studies: FastAPI,
   Poetry, Streamlit (the unit-test install on 3.15), FastMCP and Pydantic AI, plus the whole-lockfile scan of PDM,
-  where it is in the `doc` group and outside what the CI test job installs.
+  where it is in the `doc` group and outside what the CI test job installs. The MCP Python SDK pins PyYAML 6.0.2
+  (its `docs` group), which has wheels up to CPython 3.13 only; 6.0.3 adds the 3.14 wheel but not 3.15.
 - **watchdog 6.0.0** has macOS wheels up to CPython 3.13 only, so it is a source build on `macos-arm64` for 3.14 and
   3.15; 7.0.0 has the wheel. Its Linux and Windows wheels are `py3-none`, so those targets are covered. Three
   studies, each time through mkdocs: Textual (the `dev` group) and the whole-lockfile scans of pydantic and PDM.
-- **MarkupSafe 3.0.3** has no CPython 3.15 wheel; 3.0.4 does. Two studies: mitmproxy and PDM.
+- **MarkupSafe 3.0.3** has no CPython 3.15 wheel; 3.0.4 does. Two studies: mitmproxy and PDM. The MCP Python SDK
+  pins 3.0.2 (its `docs` group), which has none for 3.14 or 3.15 either; 3.0.4 has both.
 - **orjson** publishes a CPython 3.15 `x86_64` wheel tagged `manylinux_2_39`, so it is a source build at the default
   glibc 2.36 floor and a wheel at glibc 2.39. Two studies: Streamlit (orjson 3.13.0) and Pydantic AI (3.12.0).
 - **mkdocs-exclude 1.0.2** publishes only an sdist. Two studies: Textual (the `dev` group) and the whole-lockfile
   scan of pydantic.
 - **cryptography 50.0.2** has no macOS Intel wheel (mitmproxy) and no Windows on ARM wheel (HERD), and no newer
   release has either. Two studies.
+- **cffi 2.0.0** has no CPython 3.15 wheel; 2.1.0 does. Two studies: the MCP Python SDK, where it is a runtime
+  dependency through `pyjwt[crypto]` and cryptography, and the whole-lockfile scan of PDM.
+- **jiter 0.16.0** has wheels up to CPython 3.14 only; 0.17.0 has 3.15 wheels. Two studies: FastMCP and the MCP
+  Python SDK (the opt-in `translate` group).
+- **forbiddenfruit 0.1.4** publishes only an sdist and is the newest release. Two studies: Pydantic AI and the MCP
+  Python SDK (the `dev` group, through blockbuster).
 
 ## The studies
 

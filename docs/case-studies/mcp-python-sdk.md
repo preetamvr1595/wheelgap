@@ -41,6 +41,7 @@ The excerpts below are from the `--explain --suggest` output, trimmed: `…` mar
 **Group:** runtime. `mcp` depends on `pyjwt[crypto]`, which brings in `cryptography` and then `cffi` on every target; on Windows the `dev` group's `trio` also needs it.
 
 Dependency paths reported:
+
 - Linux: `mcp → pyjwt → cryptography → cffi`
 - Windows: `mcp → trio → cffi`
 
