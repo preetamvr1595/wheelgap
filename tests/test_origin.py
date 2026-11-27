@@ -48,6 +48,7 @@ def package(tmp_path, files, name="nowheels"):
         ({"nowheels==0.9": ""}, True),  # a name on the command line, found on pypi.org
         ({"requirements.txt": "nowheels==0.9\n"}, True),
         ({"requirements.txt": "--index-url https://pypi.corp.example/simple\nnowheels==0.9\n"}, False),
+        ({"requirements.txt": "--pypi-url https://pypi.corp.example/simple\nnowheels==0.9\n"}, False),  # -i too
         ({"requirements.txt": "nowheels==0.9\n", "uv.toml": "index-url = 'https://x.example/simple'\n"}, False),
         ({"pyproject.toml": PYPROJECT}, True),
         ({"pyproject.toml": PYPROJECT + "\n[[tool.uv.index]]\nurl = 'https://pypi.corp.example/simple'\n"}, False),
@@ -131,6 +132,13 @@ def package(tmp_path, files, name="nowheels"):
         ({"requirements.txt": "-c ${CONSTRAINTS}\nnowheels==0.9\n"}, False),
         ({"requirements.txt": "--requirem more.txt\nnowheels==0.9\n", "more.txt": ""}, False),
         ({"requirements.txt": "--cons=more.txt\nnowheels==0.9\n", "more.txt": ""}, False),
+        ({"requirements.txt": "--pre --req more.txt\nnowheels==0.9\n", "more.txt": ""}, False),
+        ({"requirements.txt": '--pre "--req" more.txt\nnowheels==0.9\n', "more.txt": ""}, False),
+        (
+            {"requirements.txt": "--pre -r more.txt\nnowheels==0.9\n", "more.txt": "--index-url https://x.example/s\n"},
+            False,
+        ),
+        ({"requirements.txt": "--pre -r more.txt\nnowheels==0.9\n", "more.txt": "purewheel==3.1\n"}, True),
         ({"requirements.txt": "--require-hashes\nnowheels==0.9 --hash=sha256:00\n"}, True),
         ({"requirements.txt": "-c cons.txt\nnowheels==0.9\n", "cons.txt": "nowheels<1\n"}, True),
     ],
@@ -146,7 +154,9 @@ def test_pixi_lock_entries_are_not_known(fake_pypi, tmp_path):
     assert pkg.found_on_pypi and not origin.known_pypi(pkg, source, env=EMPTY)
 
 
-@pytest.mark.parametrize("variable", [*origin.INDEX_ENV, "UV_INDEX_CORP_USERNAME", "PIP_index_url", "PIP_Find_Links"])
+@pytest.mark.parametrize(
+    "variable", [*origin.INDEX_ENV, "UV_INDEX_CORP_USERNAME", "PIP_index_url", "PIP_Find_Links", "PIP_PYPI_URL"]
+)
 def test_an_index_in_the_environment(fake_pypi, tmp_path, variable):
     env = {variable: "https://pypi.corp.example/simple"}
     pkg, source = package(tmp_path, {"requirements.txt": "nowheels==0.9\n"})

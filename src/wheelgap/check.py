@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import re
 from collections import deque
 from collections.abc import Callable, Iterable
@@ -26,7 +27,9 @@ from .sources import (
     Package,
     PoetryExtras,
     Source,
+    SourceError,
     UvSelection,
+    uv_conflict_name,
     uv_extra_names,
     uv_group_names,
     uv_selected_roots,
@@ -192,8 +195,6 @@ def _platform_reason(plat: str, target: Target) -> str:
     elif plat.startswith("manylinux") and "_" in plat:  # manylinux2014_aarch64 and friends
         legacy, wheel_arch = plat.split("_", 1)
         kind, (major, minor) = "manylinux", _LEGACY_GLIBC.get(legacy, (0, 0))
-    elif plat == f"linux_{arch}" and family == "musllinux":
-        return f"{plat} is a plain Linux (glibc) build; wheelgap only counts musllinux wheels for musl"
     else:
         return f"{plat} doesn't match {target.platform}"
     same_arch = wheel_arch == arch or (kind == "macosx" and wheel_arch == "universal2")
@@ -219,6 +220,10 @@ def _platform_reason(plat: str, target: Target) -> str:
     return f"{plat} doesn't match {target.platform}"
 
 
+# --explain's reason for an abi3 wheel on a free-threaded target; --fix names it for a gap with no fix (fix.abi3_only).
+ABI3_ON_FREETHREADED = "abi3 wheels can't be used on free-threaded Python (only abi3t ones can)"
+
+
 def rejection(filename: str, target: Target) -> str | None:
     """Why `target` can't install this wheel, or None if it can."""
     wheel = _parsed_tags(filename)
@@ -234,7 +239,7 @@ def rejection(filename: str, target: Target) -> str | None:
                 minors = [int(t.interpreter[3:]) for t in stable if t.interpreter[3:].isdigit()]
                 return f"abi3t wheels need CPython 3.{min(minors)}+ (free-threaded)" if minors else "abi3t wheel"
             if any(t.abi == "abi3" for t in wheel):
-                return "abi3 wheels can't be used on free-threaded Python (only abi3t ones can)"
+                return ABI3_ON_FREETHREADED
         built = ", ".join(sorted({f"{t.interpreter}-{t.abi}" for t in wheel}))
         return f"built for {built}, not CPython {target.python}"
     # Name the tag closest to the target: same arch first, and the modern manylinux_2_17_* form
@@ -284,6 +289,7 @@ def explain(
     *,
     no_binary: bool = False,
     only_binary: bool = False,
+    hash_rejected: dict[str, str] | None = None,
 ) -> list[tuple[str, str]]:
     """(filename, reason) for every wheel `target` rejects, the closest misses first.
 
@@ -310,6 +316,10 @@ def explain(
         for f, reason in requires_python_rejected.items():
             if f.endswith(".whl"):  # a wheel the target can't use anyway says why, not that a newer Python fits
                 out.append((f, rejection(f, target) or reason))
+    if hash_rejected:
+        for f, reason in hash_rejected.items():
+            if f.endswith(".whl"):
+                out.append((f, rejection(f, target) or reason))
     return sorted(out, key=lambda fr: _closeness(fr[0], target))
 
 
@@ -328,6 +338,7 @@ def explain_lines(
     align: bool = False,
     no_binary: bool = False,
     only_binary: bool = False,
+    hash_rejected: dict[str, str] | None = None,
 ) -> list[str]:
     """What --explain says under a gap on `target`: each rejected wheel and why (the closest misses first, at most
     `limit` of them), or that none were published, and a note when the target can't build the sdist there is.
@@ -335,7 +346,15 @@ def explain_lines(
     The command line aligns the reasons in a column, dims them and indents each line; Result.reasons joins them
     unaligned (one space-separated "file  reason" per line) and with no limit.
     """
-    rejected = explain(files, target, yanked, requires_python_rejected, no_binary=no_binary, only_binary=only_binary)
+    rejected = explain(
+        files,
+        target,
+        yanked,
+        requires_python_rejected,
+        no_binary=no_binary,
+        only_binary=only_binary,
+        hash_rejected=hash_rejected,
+    )
     out = [] if rejected else [dim("no wheels published for this version")]
     shown = rejected[:limit]
     width = max((len(f) for f, _ in shown), default=0) if align else 0
@@ -404,8 +423,32 @@ def _evaluate_atom(
         return None
 
 
+@dataclass(frozen=True)
+class ConflictWorld:
+    """Which of a uv.lock's conflict items are on in one install (see _conflict_worlds): `active` of the `known` ones,
+    as uv_conflict_name names. A marker's `extra == 'extra-4-demo-old'` holds exactly when that name is active."""
+
+    active: frozenset[str]
+    known: frozenset[str]
+
+
+def _conflict_atom(node: tuple, world: ConflictWorld) -> bool | None:
+    """`extra == NAME` or `extra != NAME` for a conflict item of the lock, as uv evaluates it: whether NAME is in the
+    activated set (UniversalMarker::evaluate). Anything else is None."""
+    if len(node) != 3 or str(node[1].value) not in ("==", "!="):
+        return None
+    value = node[2] if isinstance(node[0], _Variable) else node[0]
+    if not isinstance(value, _Value) or (name := canonicalize_name(value.value)) not in world.known:
+        return None
+    return (name in world.active) == (str(node[1].value) == "==")
+
+
 def _atom(
-    node: tuple, target: Target | None, environment: dict | None = None, poetry_extras: PoetryExtras | None = None
+    node: tuple,
+    target: Target | None,
+    environment: dict | None = None,
+    poetry_extras: PoetryExtras | None = None,
+    conflicts: ConflictWorld | None = None,
 ) -> bool | None:
     """One comparison: True/False, or None when it involves something we can't know (or, with no target, anything
     but a Poetry extra)."""
@@ -426,6 +469,8 @@ def _atom(
             parts.append(str(n.value))  # the operator
     if poetry_extras is not None and names == {"extra"}:
         return _poetry_extra(node, poetry_extras)
+    if conflicts is not None and names == {"extra"} and (decided := _conflict_atom(node, conflicts)) is not None:
+        return decided
     if target is None or not names or names & ((_UNKNOWABLE - (environment or {}).keys()) | target.unknown_markers):
         return None
     text = " ".join(parts)
@@ -468,7 +513,11 @@ def _poetry_extra(node: tuple, extras: PoetryExtras) -> bool | None:
 
 
 def _evaluate3(
-    markers: list, target: Target | None, environment: dict | None = None, poetry_extras: PoetryExtras | None = None
+    markers: list,
+    target: Target | None,
+    environment: dict | None = None,
+    poetry_extras: PoetryExtras | None = None,
+    conflicts: ConflictWorld | None = None,
 ) -> bool | None:
     """Kleene evaluation of packaging's parsed marker list: `and` binds tighter than `or`."""
     groups: list[list[bool | None]] = [[]]
@@ -478,9 +527,9 @@ def _evaluate3(
         elif item == "and":
             continue
         elif isinstance(item, list):
-            groups[-1].append(_evaluate3(item, target, environment, poetry_extras))
+            groups[-1].append(_evaluate3(item, target, environment, poetry_extras, conflicts))
         else:
-            groups[-1].append(_atom(item, target, environment, poetry_extras))
+            groups[-1].append(_atom(item, target, environment, poetry_extras, conflicts))
     results: list[bool | None] = []
     for group in groups:
         results.append(False if False in group else None if None in group else True)
@@ -533,10 +582,11 @@ def marker_value(
     *,
     extras: frozenset[str] | None = None,
     groups: frozenset[str] | None = None,
+    conflicts: ConflictWorld | None = None,
 ) -> bool | None:
     """Whether `marker` holds on `target`, or None when the target can't decide it: a marker that doesn't parse, or one
     that depends on something unknown there (platform_release, platform_version, an `extra` when `extras` is None,
-    platform_machine on a target whose machine name isn't fixed)."""
+    platform_machine on a target whose machine name isn't fixed). `conflicts` decides a uv.lock's conflict items."""
     if not marker:
         return True
     m = _parsed_marker(marker)
@@ -544,10 +594,10 @@ def marker_value(
         return None
     try:
         if extras is None and groups is None:
-            return _evaluate3(m._markers, target)
-        # uv's synthetic conflict marker names aren't public extra names. Preserve their
-        # existing unknown/conservative treatment rather than hiding a potentially needed wheel.
-        synthetic = bool(re.search(r"(?:extra|group)-\d+-", marker))
+            return _evaluate3(m._markers, target, conflicts=conflicts)
+        # uv's synthetic conflict marker names aren't public extra names: unknown, so a possibly needed wheel isn't
+        # hidden, unless `conflicts` says which of them are on.
+        synthetic = bool(re.search(r"(?:extra|group|project)-\d+-", marker))
         contexts = extras | {""} if extras is not None and not synthetic else {None}
         results: set[bool | None] = set()
         for extra in contexts:
@@ -556,7 +606,7 @@ def marker_value(
                 environment.update(extra=extra, extras=extras)
             if groups is not None:
                 environment["dependency_groups"] = groups
-            results.add(_evaluate3(m._markers, target, environment))
+            results.add(_evaluate3(m._markers, target, environment, conflicts=conflicts))
         return True if True in results else None if None in results else False
     except Exception:  # packaging changed its internals: unknown
         return None
@@ -568,10 +618,98 @@ def marker_holds(
     *,
     extras: frozenset[str] | None = None,
     groups: frozenset[str] | None = None,
+    conflicts: ConflictWorld | None = None,
 ) -> bool:
     """Whether `marker` can hold on `target`: unknown counts as holding, to assume a package is needed rather than
     hide a gap."""
-    return marker_value(marker, target, extras=extras, groups=groups) is not False
+    return marker_value(marker, target, extras=extras, groups=groups, conflicts=conflicts) is not False
+
+
+def lock_environment_targets(source: Source, targets: Iterable[Target]) -> tuple[list[Target], list[Target]]:
+    """The targets a uv.lock's supported-markers leave out, and those they can't be decided for.
+
+    The markers are the project's `[tool.uv] environments`. `uv sync` installs the lock only where one of them
+    holds, and fails anywhere else ("The current Python platform is not compatible with the lockfile's supported
+    environments"):
+    https://github.com/astral-sh/uv/blob/0.13.9/crates/uv-environment-operations/src/sync.rs#L174-L196
+    A target is undecided when no marker holds for sure and one depends on something the target doesn't fix
+    (platform_release, platform_machine on win32, a patch release of Python) or doesn't parse.
+    """
+    outside: list[Target] = []
+    undecided: list[Target] = []
+    if source.supported_markers:
+        for target in targets:
+            values = {marker_value(marker, target) for marker in source.supported_markers}
+            if True not in values:
+                (undecided if None in values else outside).append(target)
+    return outside, undecided
+
+
+def check_lock_environments(source: Source, targets: Iterable[Target]) -> None:
+    """SourceError unless every target is in the environments a uv.lock was locked for.
+
+    uv resolves such a lock for its environments only: it drops the packages only other environments need (a
+    Windows-only dependency in a Linux-only lock) and the wheels for other platforms, so reading it for another
+    target would report gaps that aren't there and miss packages that are. `uv sync` refuses to install it there.
+    """
+    targets = list(targets)
+    outside, undecided = lock_environment_targets(source, targets)
+    if not outside and not undecided:
+        return
+    with_python = len({t.python for t in targets}) > 1
+
+    def names(some: list[Target]) -> str:
+        return ", ".join(t.label(with_python) for t in some)
+
+    markers = "; ".join(source.supported_markers)
+    if not outside:
+        raise SourceError(
+            f"{source.label}: can't tell whether this lock covers {names(undecided)}: it was locked for "
+            f"`[tool.uv] environments` only ({markers}), which those targets don't decide, and `uv sync` fails "
+            "outside them; check targets the markers decide"
+        )
+    covered = [t for t in targets if t not in outside and t not in undecided]
+    raise SourceError(
+        f"{source.label}: this lock doesn't cover {names(outside)}: it was locked for `[tool.uv] environments` "
+        f"only ({markers}), so `uv sync` fails there and the lock leaves out the packages and wheels other "
+        "environments need; "
+        + (
+            f"of the targets asked for it covers {names(covered)}"
+            if covered
+            else "it covers none of the targets asked for"
+        )
+        + " (to check the others, add them to environments and run `uv lock`)"
+    )
+
+
+def narrow_to_lock_environments(
+    sources: Iterable[Source], targets: list[Target], *, every: bool = False
+) -> tuple[list[Target], list[str]]:
+    """Targets nobody named (the default platforms, or --advisory ones) without the platforms a uv.lock made with
+    `[tool.uv] environments` leaves out for every Python asked for, and those platforms. With several locks a
+    platform goes when one of them leaves it out; with every=True (`wheelgap diff`) only when all of them do, so a
+    platform one side gives up stays and check_lock_environments refuses it. A platform covered for some of the
+    Pythons only stays, and is refused there too. Nothing goes when no target would be left."""
+    sources = list(sources)
+    if not any(source.supported_markers for source in sources):
+        return targets, []
+    # A lock without environments leaves nothing out, so with every=True it keeps every platform.
+    outside = [set(lock_environment_targets(source, targets)[0]) for source in sources]
+    unlocked = set.intersection(*outside) if every else set.union(*outside)
+    locked = {t.platform for t in targets if t not in unlocked}
+    left_out = list(dict.fromkeys(t.platform for t in targets if t.platform not in locked))
+    if not locked or not left_out:
+        return targets, []
+    return [t for t in targets if t.platform in locked], left_out
+
+
+def lock_environments_note(sources: Iterable[Source], left_out: list[str], kept: list[Target], what: str) -> str:
+    labels = ", ".join(dict.fromkeys(source.label for source in sources if source.supported_markers))
+    checked = ", ".join(dict.fromkeys(t.platform for t in kept))
+    return (
+        f"{labels} is locked for `[tool.uv] environments` only, which leave out {', '.join(left_out)}: "
+        f"checking the {what} it covers ({checked})"
+    )
 
 
 # How a package was reached: the index of the package that depends on it, the name of the
@@ -620,14 +758,133 @@ def _narrow_candidates(
     return candidates
 
 
+def _uv_manifest_fork(source: Source, candidates: list[int], target: Target) -> list[int]:
+    """The entries of a uv.lock manifest dependency that `uv sync` can install on `target`.
+
+    The `[manifest]` requirements (a script's dependencies) and dependency groups (a virtual workspace root's) name
+    only the package, not the `version` and `marker` a package's edges carry, so a package uv forked per Python or
+    platform matches an entry per fork. uv takes the one entry whose own `resolution-markers` hold on the target, or
+    that has none (find_by_markers in https://github.com/astral-sh/uv/blob/0.13.9/crates/uv-lock/src/lock/mod.rs,
+    commit 6b2d39dcc390, called for the manifest's requirements and dependency groups in to_resolution_from_packages
+    in crates/uv-lock/src/lock/installable.rs, which `uv sync` and `uv sync --script` always run with the manifest).
+    It evaluates them without extras; it writes them simplified against requires-python, which doesn't change them
+    on a target inside it. A marker the target can't decide counts as holding, and when no entry fits (uv would fail:
+    MissingRootPackage) every entry is kept, so a gap is never hidden."""
+    if len(candidates) < 2:
+        return candidates
+    packages = source.uv_packages or []
+    kept: list[int] = []
+    for i in candidates:
+        markers = packages[i].get("resolution-markers", [])
+        if not isinstance(markers, list) or not all(isinstance(m, str) for m in markers):
+            return candidates
+        if not markers or any(marker_holds(m, target) for m in markers):
+            kept.append(i)
+    return kept or candidates
+
+
 def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | None = None) -> dict[int, Parent]:
-    """Walk selected uv roots, re-visiting a package when another edge activates more extras."""
+    """Walk selected uv roots, re-visiting a package when another edge activates more extras. In a lock with
+    `conflicts`, the packages any of the installs _conflict_worlds lists makes, each with its shortest path."""
+    worlds = _conflict_worlds(source, target)
+    if worlds is None:
+        return _uv_walk(source, target, paths)[0]
+    parents: dict[int, Parent] = {}
+    shortest: dict[int, list[str]] = {}
+    for _world, _dropped, found, found_paths in worlds:
+        for i, parent in found.items():
+            if i not in parents or len(found_paths[i]) < len(shortest[i]):
+                parents[i], shortest[i] = parent, found_paths[i]
+    if paths is not None:
+        paths.update(shortest)
+    return parents
+
+
+# More ways of picking a lock's conflicts than this, and its conflict items stay unknown.
+_MAX_CONFLICT_PICKS = 64
+
+
+def _conflict_worlds(
+    source: Source, target: Target
+) -> list[tuple[ConflictWorld, frozenset[str], dict[int, Parent], dict[int, list[str]]]] | None:
+    """The installs `uv sync` can make of a uv.lock with `conflicts`, on `target`, for its selection: each as the
+    conflict items it turns on, the ones the pick turned off, and what the walk reaches. None when the lock has no
+    conflicts, or when this can't be worked out as uv does, which leaves the items unknown as before.
+
+    uv writes a lock's markers with its conflict items as `extra == 'extra-4-demo-old'` terms, and with clauses that
+    hold only when two sides of one conflict are on, such as `extra == 'extra-4-demo-new' and extra ==
+    'extra-4-demo-old'` (UniversalMarker::imbibe keeps them so a lock reader can find a conflict an edge turns on). At
+    install time it evaluates each marker against the items that are on: the project, each selected extra that has
+    dependencies and each selected group of the packages it installs, plus every extra an edge asks for (`pkg[x]`),
+    found in a first walk; and it refuses an install that turns on two extras of one conflict
+    (to_resolution_from_packages in
+    https://github.com/astral-sh/uv/blob/0.13.9/crates/uv-lock/src/lock/installable.rs). A selection that asks for
+    two items of one conflict (as wheelgap's default, every extra and group, does), `uv sync` refuses
+    (detect_conflicts in crates/uv-environment-operations/src/lib.rs), so wheelgap takes each way of turning on none
+    or one of them, as `uv sync --no-extra ...` would, and checks what any of them installs.
+    """
+    sets = source.uv_conflicts
+    # A conflict between whole projects would mean leaving members out of the install: not worked out here.
+    if not sets or any(name.startswith("project-") for items in sets for name in items):
+        return None
+    known = frozenset(name for items in sets for name in items)
     selection = source.uv_selection
     everything = selection is None
     if selection is None:
         selection = UvSelection(all_extras=True)
     packages = source.uv_packages or []
     roots = source.roots if everything else uv_selected_roots(source)
+    groups = _uv_groups(source, selection, everything, roots)
+    asked: set[str] = set()  # what the selection asks for, as detect_conflicts counts it
+    seed: set[str] = set()  # what uv turns on for it before following edges
+    for i in roots:
+        name = canonicalize_name(packages[i].get("name", ""))
+        if not selection.only_groups:
+            seed.add(uv_conflict_name(name, "project"))
+            wanted = known if selection.all_extras else {uv_conflict_name(name, "extra", e) for e in selection.extras}
+            asked |= {n for n in known if n.startswith(f"extra-{len(name)}-{name}-") and n in wanted}
+            for extra in packages[i].get("optional-dependencies", {}):
+                if (n := uv_conflict_name(name, "extra", extra)) in wanted:
+                    seed.add(n)
+        chosen = {uv_conflict_name(name, "group", g) for g in groups}
+        asked |= {n for n in known if n.startswith(f"group-{len(name)}-{name}-") and (everything or n in chosen)}
+        seed |= {
+            n for g in packages[i].get("dev-dependencies", {}) if (n := uv_conflict_name(name, "group", g)) in chosen
+        }
+    choices: list[list[frozenset[str]]] = []
+    for items in sets:
+        on = [name for name in dict.fromkeys(items) if name in asked]
+        if len(on) >= 2:  # none of them, or one
+            choices.append([frozenset(on), *(frozenset(on) - {keep} for keep in on)])
+    picks = list(dict.fromkeys(frozenset().union(*combo) for combo in itertools.product(*choices)))
+    if len(picks) > _MAX_CONFLICT_PICKS:
+        return None
+    worlds = []
+    for dropped in picks:
+        start = frozenset(seed - dropped)
+        active = start
+        for _ in range(len(known) + 2):
+            world = ConflictWorld(active, known)
+            found_paths: dict[int, list[str]] = {}
+            found, turned_on = _uv_walk(source, target, found_paths, world, dropped, start)
+            if turned_on <= active:
+                break
+            active |= turned_on
+        else:
+            return None
+        if start | turned_on != active:
+            # An extra an edge turned on is no longer reached once it's on: uv's answer depends on the order it
+            # walks the lock in.
+            return None
+        if any(sum(name in active for name in items if name.startswith("extra-")) >= 2 for items in sets):
+            continue  # uv refuses this install: an edge turns on a second extra of a conflict
+        worlds.append((world, dropped, found, found_paths))
+    return worlds or None
+
+
+def _uv_groups(source: Source, selection: UvSelection, everything: bool, roots: list[int]) -> frozenset[str]:
+    """The dependency groups a uv.lock walk follows for `selection`."""
+    packages = source.uv_packages or []
     available_groups = {canonicalize_name(name) for name in source.uv_manifest.get("dependency-groups", {})} | {
         name for i in roots for name in uv_group_names(packages[i])
     }
@@ -640,10 +897,32 @@ def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | 
         groups = frozenset(available_groups)
     if selection.no_dev:
         groups = groups - {"dev"}
-    groups = frozenset(groups)
+    return frozenset(groups)
+
+
+def _uv_walk(
+    source: Source,
+    target: Target,
+    paths: dict[int, list[str]] | None = None,
+    world: ConflictWorld | None = None,
+    dropped: frozenset[str] = frozenset(),
+    early: frozenset[str] = frozenset(),
+) -> tuple[dict[int, Parent], frozenset[str]]:
+    """_uv_reachable's walk, and with a conflict `world` the conflict items its edges turn on (`pkg[x]`). `dropped`:
+    conflict items of the roots the pick leaves off (their extras and groups aren't followed). `early`: the items uv
+    has on when it evaluates the roots' group edges, before its first walk (the roots' selected extras and groups)."""
+    selection = source.uv_selection
+    everything = selection is None
+    if selection is None:
+        selection = UvSelection(all_extras=True)
+    packages = source.uv_packages or []
+    roots = source.roots if everything else uv_selected_roots(source)
+    groups = _uv_groups(source, selection, everything, roots)
     by_name: dict[str, list[int]] = {}
     for i, package in enumerate(source.packages):
         by_name.setdefault(package.key, []).append(i)
+    turned_on: set[str] = set()
+    group_on: set[str] = set()  # extras the roots' group edges turned on so far, in uv's order
     parents: dict[int, Parent] = {}
     active: dict[int, frozenset[str]] = {}
     queue: deque[tuple[int, frozenset[str], list[str]]] = deque()
@@ -659,19 +938,38 @@ def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | 
             active[i] |= extras
             queue.append((i, active[i], path))
 
-    def follow(dependencies: list[dict], parent: Parent, extras: frozenset[str], path: list[str]) -> None:
+    def follow(
+        dependencies: list[dict], parent: Parent, extras: frozenset[str], path: list[str], manifest: str = ""
+    ) -> None:
         for dependency in dependencies:
-            if not marker_holds(dependency.get("marker"), target, extras=extras, groups=groups):
+            requested = frozenset(
+                canonicalize_name(extra) for extra in dependency.get("extra", dependency.get("extras", []))
+            )
+            conflicts = world
+            if world is not None:
+                # uv counts an edge's own extras as on for its marker, and turns them on (except for the manifest's
+                # requirements); it evaluates the manifest's edges with nothing on.
+                own = frozenset(uv_conflict_name(dependency["name"], "extra", e) for e in requested) & world.known
+                if manifest == "root-group":
+                    # uv evaluates a root's group edges before its first walk, with only the roots' selected items
+                    # and the extras earlier group edges turned on (to_resolution_from_packages; its TODO).
+                    conflicts = ConflictWorld(early | group_on | own, world.known)
+                else:
+                    conflicts = ConflictWorld(frozenset() if manifest else world.active | own, world.known)
+            if not marker_holds(dependency.get("marker"), target, extras=extras, groups=groups, conflicts=conflicts):
                 continue
+            if world is not None and manifest != "requirements":
+                turned_on.update(own)
+                if manifest == "root-group":
+                    group_on.update(own)
             candidates = _narrow_candidates(
                 source,
                 by_name.get(canonicalize_name(dependency["name"]), []),
                 dependency.get("version"),
                 dependency.get("source"),
             )
-            requested = frozenset(
-                canonicalize_name(extra) for extra in dependency.get("extra", dependency.get("extras", []))
-            )
+            if manifest in ("requirements", "group"):
+                candidates = _uv_manifest_fork(source, candidates, target)
             for i in candidates:
                 visit(i, parent, requested, [*path, source.packages[i].name])
 
@@ -682,24 +980,30 @@ def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | 
             if canonicalize_name(name) in extras:
                 follow(optional, i, extras, path)
 
+    def off(i: int, kind: str, name: str) -> bool:
+        return bool(dropped) and uv_conflict_name(packages[i].get("name", ""), kind, name) in dropped
+
     if not selection.only_groups:
         for i in roots:
             optional = uv_extra_names(packages[i])
-            visit(i, None, optional if selection.all_extras else selection.extras & optional, [source.packages[i].name])
+            extras = optional if selection.all_extras else selection.extras & optional
+            visit(i, None, frozenset(e for e in extras if not off(i, "extra", e)), [source.packages[i].name])
         # Runtime paths take priority over equally short group paths in --explain.
         for _ in roots:
             dependencies(*queue.popleft())
-        follow(source.uv_manifest.get("requirements", []), None, selection.extras, [])
+        follow(source.uv_manifest.get("requirements", []), None, selection.extras, [], "requirements")
     for i in roots:
         for name, group in packages[i].get("dev-dependencies", {}).items():
-            if canonicalize_name(name) in groups:
-                follow(group, canonicalize_name(name), frozenset(), [f"({canonicalize_name(name)} group)"])
+            if canonicalize_name(name) in groups and not off(i, "group", name):
+                follow(
+                    group, canonicalize_name(name), frozenset(), [f"({canonicalize_name(name)} group)"], "root-group"
+                )
     for name, group in source.uv_manifest.get("dependency-groups", {}).items():
         if canonicalize_name(name) in groups:
-            follow(group, canonicalize_name(name), frozenset(), [f"({canonicalize_name(name)} group)"])
+            follow(group, canonicalize_name(name), frozenset(), [f"({canonicalize_name(name)} group)"], "group")
     while queue:
         dependencies(*queue.popleft())
-    return parents
+    return parents, frozenset(turned_on)
 
 
 def dropped_targets(local: list[str], last: list[tuple[str, str | None]], targets: Iterable[Target]) -> list[Target]:
@@ -805,13 +1109,15 @@ def applies(pkg: Package, target: Target) -> bool:
 
 
 def _selected_direct_dependencies(
-    source: Source, target: Target, installed: dict[int, Parent] | dict[int, list[str]], selection: UvSelection
+    source: Source, target: Target, installed: dict[int, Parent] | dict[int, list[str]], selection: UvSelection | None
 ) -> dict[int, tuple[str, ...]]:
     """Attribute selected uv dependencies per direct root, keeping requested extras separate. With no --extra/--group
-    selection, `selection` is UvSelection(): the project's own dependencies and the dev group, no extras. That walks
-    less than reachable() installs, so some packages get no hint, but every one credited really is reached that way."""
+    selection, `selection` is None: the whole lock is checked (all members, extras, and groups)."""
     packages = source.uv_packages or []
-    roots = uv_selected_roots(source)
+    everything = selection is None
+    if selection is None:
+        selection = UvSelection(all_extras=True)
+    roots = source.roots if everything else uv_selected_roots(source)
     available = {canonicalize_name(n) for n in source.uv_manifest.get("dependency-groups", {})} | {
         n for i in roots for n in uv_group_names(packages[i])
     }
@@ -820,6 +1126,8 @@ def _selected_direct_dependencies(
     else:
         defaults = available if "*" in source.uv_default_groups else frozenset(source.uv_default_groups)
         selected = selection.groups | defaults
+    if everything:
+        selected = frozenset(available)
     groups = frozenset(selected - {"dev"} if selection.no_dev else selected)
     by_name: dict[str, list[int]] = {}
     for i, pkg in enumerate(source.packages):
@@ -829,6 +1137,8 @@ def _selected_direct_dependencies(
     owners: dict[int, dict[str, str]] = {}
     active: dict[tuple[int, str], frozenset[str]] = {}
     queue: deque[tuple[int, str]] = deque()
+    # The project (or, in a virtual workspace, every member) is where hints start; other members are named.
+    direct_roots = set(uv_selected_roots(source))
 
     def visit(i: int, owner: tuple[str, str], requested: frozenset[str]) -> None:
         key, label = owner
@@ -842,9 +1152,19 @@ def _selected_direct_dependencies(
             active[state] = previous | requested
             queue.append(state)
 
+    # A lock with conflicts: an edge counts if it holds in one of the installs (the hint follows only packages
+    # some install reaches anyway).
+    worlds = [world for world, *_ in _conflict_worlds(source, target) or []]
+
     def follow(items: list[dict], owner: tuple[str, str] | None, extras: frozenset[str]) -> None:
         for d in items:
-            if not marker_holds(d.get("marker"), target, extras=extras, groups=groups):
+            if worlds:
+                if not any(
+                    marker_holds(d.get("marker"), target, extras=extras, groups=groups, conflicts=world)
+                    for world in worlds
+                ):
+                    continue
+            elif not marker_holds(d.get("marker"), target, extras=extras, groups=groups):
                 continue
             matches = _narrow_candidates(
                 source, by_name.get(canonicalize_name(d["name"]), []), d.get("version"), d.get("source")
@@ -864,12 +1184,13 @@ def _selected_direct_dependencies(
             p = packages[i]
             possible = uv_extra_names(p)
             extras = possible if selection.all_extras else selection.extras & possible
-            follow(p.get("dependencies", []), None, extras)
+            owner = None if i in direct_roots else (source.packages[i].key, source.packages[i].name)
+            follow(p.get("dependencies", []), owner, extras)
             for name, optional in p.get("optional-dependencies", {}).items():
                 if canonicalize_name(name) in extras:
-                    follow(optional, None, extras)
+                    follow(optional, owner, extras)
         follow(source.uv_manifest.get("requirements", []), None, selection.extras)
-    for i in roots:
+    for i in roots:  # a member's group, like the project's, starts at the group: --explain shows `(NAME group) → …`
         for name, items in packages[i].get("dev-dependencies", {}).items():
             if canonicalize_name(name) in groups:
                 follow(items, None, frozenset())
@@ -895,7 +1216,7 @@ def direct_dependencies(
     if source.edges is None:
         return {}
     if source.uv_packages is not None:  # a uv.lock: walk extras per owner, selected or uv's defaults
-        return _selected_direct_dependencies(source, target, installed, source.uv_selection or UvSelection())
+        return _selected_direct_dependencies(source, target, installed, source.uv_selection)
     by_name: dict[str, list[int]] = {}
     for i, pkg in enumerate(source.packages):
         by_name.setdefault(pkg.key, []).append(i)
@@ -1014,7 +1335,7 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                 if needed and installed is not None:
                     row.via[t] = (
                         paths[t][i]
-                        if source.uv_selection is not None or source.deps_paths is not None
+                        if source.uv_packages is not None or source.deps_paths is not None
                         else dependency_path(source, installed[t], i)  # type: ignore[arg-type]
                     )
                     if source.deps_paths is not None:

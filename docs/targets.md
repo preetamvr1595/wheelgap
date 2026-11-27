@@ -16,8 +16,8 @@ machine-readable list.
 | --- | --- | --- |
 | `linux-x86_64` | `linux`, `linux-amd64`, `linux/amd64` | `manylinux_2_*_x86_64` up to `--glibc` (default 2.36), legacy `manylinux2014`/`2010`/`1` |
 | `linux-aarch64` | `linux-arm64`, `linux/arm64`, `linux/arm64/v8` | `manylinux_2_*_aarch64` from 2.17 up to `--glibc`, legacy `manylinux2014` |
-| `musl-x86_64` | `alpine`, `musl` | `musllinux_1_*_x86_64` up to `--musl` (default 1.2) |
-| `musl-aarch64` | `alpine-arm64` | `musllinux_1_*_aarch64` |
+| `musl-x86_64` | `alpine`, `musl` | `musllinux_1_*_x86_64` up to `--musl` (default 1.2), plain `linux_x86_64` |
+| `musl-aarch64` | `alpine-arm64` | `musllinux_1_*_aarch64`, plain `linux_aarch64` |
 | `macos-arm64` | `macos`, `mac` | `macosx_*_arm64` and `universal2` up to `--macos` (default 14.0) |
 | `macos-x86_64` | `macos-intel` | `macosx_*_x86_64` and `universal2` |
 | `win-amd64` | `windows`, `win` | `win_amd64` |
@@ -26,7 +26,7 @@ machine-readable list.
 | `linux-ppc64le`, `linux-s390x`, `linux-riscv64` | `linux/ppc64le`, `linux/s390x`, `linux/riscv64` | `manylinux_2_*` from 2.17 for that arch (`riscv64` has no legacy `manylinux2014` tag) |
 | `linux-i686` | `linux-x86`, `linux-386`, `linux/386` | `manylinux_2_*_i686` up to `--glibc`, legacy `manylinux2014`/`2010`/`1` (32-bit x86) |
 | `win32` | `windows-x86`, `win-x86` | `win32` (32-bit Python on Windows) |
-| `musl-armv7l`, `musl-ppc64le`, `musl-s390x`, `musl-riscv64`, `musl-i686` | `alpine-armv7`, `alpine-x86` | `musllinux_1_*` for that arch (pip would also take a plain `linux_armv7l` wheel on Alpine, but it's a glibc build, so wheelgap doesn't count it) |
+| `musl-armv7l`, `musl-ppc64le`, `musl-s390x`, `musl-riscv64`, `musl-i686` | `alpine-armv7`, `alpine-x86` | `musllinux_1_*` for that arch, and plain `linux_<arch>` |
 | `pyodide` | `wasm`, `wasm32`, `emscripten` | Pyodide's ABI for that Python: `emscripten_3_1_32` (3.11), `pyodide_2024_0` / `pyemscripten_2024_0` (3.12), `pyodide_2025_0` / `pyemscripten_2025_0` (3.13), `pyemscripten_2026_0` (3.14) |
 | `ios-arm64` | `ios`, `iphoneos` | `ios_*_arm64_iphoneos` up to `--ios` (default 13.0) |
 | `ios-simulator-arm64`, `ios-simulator-x86_64` | `ios-simulator` | `ios_*_arm64_iphonesimulator` / `ios_*_x86_64_iphonesimulator` |
@@ -34,8 +34,11 @@ machine-readable list.
 
 `--list-targets` shows a few more aliases than this table, such as `manylinux-x86_64` and `musllinux-aarch64`.
 
-Every glibc (`linux-*`) target also accepts a plain `linux_<arch>` wheel, as pip does. PyPI only allows those for
-32-bit ARM, so in practice they matter for `linux-armv7l` (a wheel from another index can have one too).
+Every Linux target, glibc (`linux-*`) and musl (`musl-*`) alike, also accepts a plain `linux_<arch>`
+wheel, as pip and uv do. PyPI only allows those for 32-bit ARM, so in practice they matter for `linux-armv7l` and for
+wheels from other indexes, such as PyTorch's `torch-1.10.2+cpu-cp39-cp39-linux_x86_64.whl`. Such a wheel is usually
+built against glibc: pip and uv install it on Alpine all the same, and whether it then runs there is another question
+wheelgap doesn't answer.
 
 Docker platform names also work with `-t`, for example `-t linux/amd64,linux/arm64` (also `linux/arm64/v8`,
 `linux/arm/v7`, `linux/ppc64le`, `linux/s390x`, `linux/riscv64` and `linux/386`, also spelled `linux/i386`).
@@ -164,12 +167,18 @@ the built-in defaults, and so does one matching none of the targets above (with 
 error. Only `required-environments` is used here: `environments`, extra Linux architectures, mobile and Pyodide
 targets are not inferred.
 
+`[tool.uv] environments` doesn't pick targets, but it limits them: a `uv.lock` made with it covers
+those environments only, so the built-in defaults are narrowed to the ones it covers and a target you ask for outside
+them is an error. See [uv.lock](inputs.md#uvlock).
+
 ### From a Dockerfile
 
 `--dockerfile PATH` takes the Python, the platform and the glibc or musl version from the image of the Dockerfile's
 final stage, such as `python:3.13-alpine` or `ghcr.io/astral-sh/uv:0.13.7-python3.13-trixie-slim`, following named
 stages like `FROM base AS runtime` back to the image they start from. `-p`, `-t`, `--glibc` and `--musl` on the
-command line still win, and the image wins over `[tool.wheelgap]`.
+command line still win, and the image wins over `[tool.wheelgap]`. `-p` and `-t` together are also
+enough for an image wheelgap can't read (`FROM ubuntu:24.04`, `nvidia/cuda`, a build argument with no value): the
+run checks the targets given, with a note on [what that leaves unknown](cli.md#dockerfile).
 
 A python X.Y tag without a Debian release (`python:3.13-slim`) is read as the release Docker Hub currently builds it
 on (trixie, glibc 2.41, for 3.9 and later); patch tags like `3.12.7-slim` keep the `--glibc` default. A pre-release
@@ -177,6 +186,10 @@ tag like `3.11-rc-slim` stopped being rebuilt when its Python was released, so i
 built on (bullseye for 3.10 and 3.11, bookworm for 3.12 and 3.13, trixie for 3.14 and 3.15); one still being built
 (`3.16-rc-slim`) keeps the `--glibc` default, and one older than 3.10 is an error. Pin `-bookworm` or `-trixie` for an
 answer that doesn't move. A Dockerfile wheelgap can't read the way Docker does is an error, not a guess.
+
+A tag that names a patch release (`python:3.9.1-slim`, `python:3.12.7`) is checked as its minor version, at that
+version's newest patch release, with a note that says so: see
+[which patch release is checked](how-it-works.md#patch-release).
 
 A global `ARG` used in the final stage's `FROM` (`ARG PYTHON_VERSION=3.12` then `FROM python:${PYTHON_VERSION}-slim`)
 is read from its default, with a note. When the build picks the value

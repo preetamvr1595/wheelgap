@@ -596,3 +596,39 @@ def test_no_home_folder_never_fails_a_run(capsys, fake_pypi, pinned, monkeypatch
 def test_clear_cache_with_list_targets_still_lists(capsys, lookup_cache):
     code, out, err = run(capsys, "--clear-cache", "--list-targets")
     assert code == 0 and "linux-x86_64" in out and err.startswith("wheelgap: removed")
+
+
+def test_gap_wheels_cache_age_limit(monkeypatch):
+    now = 1_800_000_000.0
+    monkeypatch.setattr(cache, "_now", lambda: now)
+
+    doc = {
+        "schema": 1,
+        "wheels": [
+            {
+                "name": "nowheels",
+                "version": "0.9",
+                "wheel": "nowheels-0.9-py3-none-any.whl",
+                "sha256": "ab" * 32,
+            }
+        ],
+    }
+    cache.save_gap_wheels(pypi.GAP_WHEELS_URL, doc)
+
+    # Immediately: valid
+    cached, saved = cache.load_gap_wheels_with_time(pypi.GAP_WHEELS_URL)
+    assert cached == doc
+    assert saved == now
+    assert cache.load_gap_wheels(pypi.GAP_WHEELS_URL) == doc
+
+    # At 59 minutes (within GAP_WHEELS_MAX_AGE = 3600):
+    saved_at = now
+    now += cache.GAP_WHEELS_MAX_AGE - 60
+    assert cache.load_gap_wheels(pypi.GAP_WHEELS_URL) == doc
+    assert cache.load_gap_wheels_with_time(pypi.GAP_WHEELS_URL) == (doc, saved_at)
+    assert cache.GAP_WHEELS_RECHECK_AGE == 5 * 60
+
+    # At 60 minutes + 1 second: expired!
+    now += 61
+    assert cache.load_gap_wheels(pypi.GAP_WHEELS_URL) is None
+    assert cache.load_gap_wheels_with_time(pypi.GAP_WHEELS_URL) == (None, None)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+from collections.abc import Sequence
 from pathlib import Path
 
 from packaging.utils import canonicalize_name
@@ -31,8 +32,17 @@ def _rank(cell: tuple[str | None, str | None]) -> int:
     return 0 if skip is not None else 1
 
 
-def junit_xml(rows: list[Row], targets: list[Target], fail_on: str, advisory: frozenset[Target] = frozenset()) -> str:
+def junit_xml(
+    rows: list[Row],
+    targets: list[Target],
+    fail_on: str,
+    advisory: frozenset[Target] = frozenset(),
+    warnings: Sequence[str] = (),
+) -> str:
     """One testsuite per target, one testcase per package.
+
+    `warnings` (`Dockerfile:8: message`, from --dockerfile-inputs) are lines the answer doesn't cover: each suite
+    gets a `wheelgap.dockerfile-warning` property and a system-out line for each, so a dashboard shows them.
 
     A cell is a failure when its status fails the run (`missing`, `unknown`,
     and `source` unless `--fail-on missing`). `n/a` is skipped, and so is a
@@ -101,6 +111,10 @@ def junit_xml(rows: list[Row], targets: list[Target], fail_on: str, advisory: fr
             failures=str(failures),
             skipped=str(skipped),
         )
+        if warnings:
+            properties = ET.SubElement(suite, "properties")
+            for warning in warnings:
+                ET.SubElement(properties, "property", name="wheelgap.dockerfile-warning", value=warning)
         for name, fail, skip, via in cases:
             case = ET.SubElement(suite, "testcase", name=name, classname=label)
             # Keep the testcase identity stable; only enrich failed and advisory-skipped messages.
@@ -117,11 +131,18 @@ def junit_xml(rows: list[Row], targets: list[Target], fail_on: str, advisory: fr
                 node = ET.SubElement(case, "skipped", message=skip + details)
                 if details:
                     node.text = "Direct dependencies: " + ", ".join(via)
+        if warnings:
+            ET.SubElement(suite, "system-out").text = "".join(f"wheelgap: warning: {w}\n" for w in warnings)
     # XML declaration so picky parsers don't have to guess the encoding.
     return ET.tostring(root, encoding="unicode", xml_declaration=True)
 
 
 def write_junit(
-    path: str, rows: list[Row], targets: list[Target], fail_on: str, advisory: frozenset[Target] = frozenset()
+    path: str,
+    rows: list[Row],
+    targets: list[Target],
+    fail_on: str,
+    advisory: frozenset[Target] = frozenset(),
+    warnings: Sequence[str] = (),
 ) -> None:
-    Path(path).write_text(junit_xml(rows, targets, fail_on, advisory), encoding="utf-8")
+    Path(path).write_text(junit_xml(rows, targets, fail_on, advisory, warnings), encoding="utf-8")

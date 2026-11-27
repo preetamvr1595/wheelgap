@@ -14,13 +14,20 @@ Run the same command with `--explain`: it lists every wheel the target rejected 
 - **A different Python.** Wheels are built per Python version, and free-threaded Python (`3.14t`) can't use `abi3`
   wheels, so a package with only `abi3` wheels builds from source there.
 - **Your lockfile is older than the wheels.** Lockfiles record the files that existed when you locked. If the project
-  uploaded wheels for that version later, `--online` re-checks the lockfile against PyPI. A `uv.lock` made with
-  `environments` restrictions also leaves out wheels for other platforms; `--online` helps there too.
+  uploaded wheels for that version later, `--online` re-checks the lockfile against PyPI.
 - **A different version.** For a version range or a bare name, wheelgap picks the newest matching release (see
   [Version ranges](how-it-works.md#version-ranges)), which may have no wheel where an older one does. Pin the version
   you install.
+- **The requirements file names another index.** pip reads `--extra-index-url`, `--index-url`, `--find-links` and
+  `--no-index` lines in a requirements file and looks there too (PyTorch's CPU and CUDA wheels, a private index);
+  wheelgap doesn't, and checks PyPI's files. It says so on stderr: `requirements.txt sets
+  --extra-index-url, which wheelgap doesn't read`. To check another index instead of PyPI, pass it to wheelgap's
+  [`--index-url`](cli.md#index-url).
 - **A yanked wheel.** pip skips a yanked wheel when the release has other files it can use, so it builds the sdist;
   `--explain` names such a wheel with the reason `yanked`.
+
+For other known edge cases where wheelgap's answer can differ from pip's and uv's, see
+[Where wheelgap differs from pip and uv](differences.md).
 
 If none of these explain it, wheelgap may be wrong, and that's the most useful bug report there is. Check the cell with
 `pip download --only-binary=:all:` for the target's tags, as
@@ -72,5 +79,5 @@ gap.
 
 ## Which version of the docs is this?
 
-These pages follow the `main` branch. Anything marked **after 0.13.0** isn't released yet; the
+These pages follow the `main` branch. Anything marked **after 0.14.0** isn't released yet; the
 [changelog](https://github.com/wheelgap/wheelgap/blob/main/CHANGELOG.md) lists it under "Unreleased".

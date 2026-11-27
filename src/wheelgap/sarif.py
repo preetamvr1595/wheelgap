@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from urllib.parse import quote
 
@@ -44,6 +45,34 @@ RULES = {
     },
 }
 WORDS = {Status.SOURCE: "builds from source on", Status.MISSING: "can't install on"}
+# --dockerfile: what the answer leaves out of the image, by result level. A rule is listed only in a run that has one.
+DOCKERFILE_RULES = {
+    "note": {
+        "id": "wheelgap/dockerfile-note",
+        "name": "DockerfileNotRead",
+        "shortDescription": {"text": "Part of the Dockerfile wasn't read: the answer is for what wheelgap was told"},
+        "fullDescription": {
+            "text": "wheelgap couldn't read this part of the Dockerfile (an image it doesn't know, say), so the -p "
+            "and -t given stand in for it and the note says what that leaves unknown."
+        },
+        "helpUri": DOCS,
+        "defaultConfiguration": {"level": "note"},
+    },
+    "warning": {
+        "id": "wheelgap/dockerfile-unseen",
+        "name": "DockerfileLineNotSeen",
+        "shortDescription": {
+            "text": "A Dockerfile line wheelgap can't see into: the answer may not be the whole image"
+        },
+        "fullDescription": {
+            "text": "--dockerfile-inputs couldn't see into this line (a script, make, an unknown program, files "
+            "copied from another stage), which comes after the last install it read. Python packages it installs "
+            "are not in the answer."
+        },
+        "helpUri": DOCS,
+        "defaultConfiguration": {"level": "warning"},
+    },
+}
 
 
 def level(status: Status, target: Target, fail_on: str, advisory: frozenset[Target]) -> str:
@@ -75,11 +104,13 @@ def sarif_log(
     sources: list[Source],
     fail_on: str,
     advisory: frozenset[Target] = frozenset(),
+    dockerfile: Sequence[tuple[str, str, int | None, str]] = (),
 ) -> dict:
     """One result per package and gap target (`source` or `missing`; not `unknown`, a failed lookup, and not
     a target `--ignore NAME:TARGET` ignores), located at the package's entry in its input file (relative to
     GITHUB_WORKSPACE, else the current directory) where the reader knows the line, else at the file's first line; a
-    package named on the command line, or in a file outside the repository, has no location."""
+    package named on the command line, or in a file outside the repository, has no location. Then one result for
+    each `dockerfile` entry, (level, Dockerfile path, line or None, message), at that line of the Dockerfile."""
     multi_py = len({t.python for t in targets}) > 1
     rule_ids = list(RULES)
     locator = Locator(sources)
@@ -124,6 +155,7 @@ def sarif_log(
                 limit=REASON_LINES,
                 no_binary=pkg.no_binary,
                 only_binary=pkg.only_binary,
+                hash_rejected=pkg.hash_rejected,
             )
             hint = via_hint(row, target)
             text = f"{name}{hint} {WORDS[status]} {label}" + (" (advisory)" if target in advisory else "") + "."
@@ -142,6 +174,29 @@ def sarif_log(
             if locations:
                 result["locations"] = locations
             results.append(result)
+    rules = list(RULES.values())
+    for kind, file, line, message in dockerfile:
+        rule = DOCKERFILE_RULES[kind]
+        if rule not in rules:
+            rules.append(rule)
+        result = {
+            "ruleId": rule["id"],
+            "ruleIndex": rules.index(rule),
+            "level": kind,
+            "message": {"text": message},
+            "partialFingerprints": {"wheelgap/v1": f"{file}:{rule['id']}:{message}"},
+        }
+        if (path := relative_path(Path(file))) is not None:
+            region = {"startLine": line if line is not None else 1}
+            result["locations"] = [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": quote(path, safe="/"), "uriBaseId": "%SRCROOT%"},
+                        "region": region,
+                    }
+                }
+            ]
+        results.append(result)
     return {
         "$schema": SCHEMA,
         "version": "2.1.0",
@@ -152,7 +207,7 @@ def sarif_log(
                         "name": "wheelgap",
                         "version": __version__,
                         "informationUri": "https://github.com/wheelgap/wheelgap",
-                        "rules": list(RULES.values()),
+                        "rules": rules,
                     }
                 },
                 "results": results,
@@ -168,5 +223,7 @@ def write_sarif(
     sources: list[Source],
     fail_on: str,
     advisory: frozenset[Target] = frozenset(),
+    dockerfile: Sequence[tuple[str, str, int | None, str]] = (),
 ) -> None:
-    Path(path).write_text(json.dumps(sarif_log(rows, targets, sources, fail_on, advisory), indent=2) + "\n", "utf-8")
+    log = sarif_log(rows, targets, sources, fail_on, advisory, dockerfile)
+    Path(path).write_text(json.dumps(log, indent=2) + "\n", "utf-8")

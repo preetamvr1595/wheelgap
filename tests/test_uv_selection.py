@@ -14,6 +14,7 @@ from wheelgap.sources import (
     file_kind,
     load_inputs,
     select_uv_dependencies,
+    uv_conflict_name,
 )
 from wheelgap.targets import build_targets
 
@@ -77,6 +78,213 @@ def test_whole_lock_follows_a_dependency_extra_only_where_it_is_requested(tmp_pa
     sources = load_inputs([str(tmp_path / "uv.lock")])
     rows = check(sources, build_targets([python], ["linux-x86_64"]))
     assert {r.package.name for r in rows if r.needed} == expected
+
+
+# The edges and markers of locks uv 0.13.1 wrote (`uv lock --python 3.13`), with the hashes left out. Two extras of
+# `demo` conflict ([tool.uv] conflicts = [[{ extra = "old" }, { extra = "new" }]]): uv writes when each side is on as
+# `extra == 'extra-4-demo-old'`, and keeps clauses that need both sides at once, which no install has.
+PORTALOCKER = """
+[[package]]
+name = "portalocker"
+version = "1.7.1"
+source = {{ registry = "https://pypi.org/simple" }}
+dependencies = [{{ name = "pywin32", marker = "{old}" }}]
+wheels = [{{ url = "https://example.invalid/portalocker-1.7.1-py2.py3-none-any.whl" }}]
+[[package]]
+name = "portalocker"
+version = "2.10.1"
+source = {{ registry = "https://pypi.org/simple" }}
+dependencies = [{{ name = "pywin32", marker = "{new}" }}]
+wheels = [{{ url = "https://example.invalid/portalocker-2.10.1-py3-none-any.whl" }}]
+[[package]]
+name = "pywin32"
+version = "312"
+source = {{ registry = "https://pypi.org/simple" }}
+wheels = [{{ url = "https://example.invalid/pywin32-312-cp313-cp313-win_amd64.whl" }}]
+"""
+OLD_172 = '{ name = "portalocker", version = "1.7.1", source = { registry = "https://pypi.org/simple" }'
+NEW_2101 = '{ name = "portalocker", version = "2.10.1", source = { registry = "https://pypi.org/simple" }'
+
+
+def conflict_lock(kind):
+    """`kind`: "extra" (the extras old and new of demo conflict) or "group" (its dependency groups, new the default)."""
+    old, new = f"{kind}-4-demo-old", f"{kind}-4-demo-new"
+    table = "optional-dependencies" if kind == "extra" else "dev-dependencies"
+    return (
+        f'version = 1\nrevision = 5\nrequires-python = ">=3.12"\n'
+        f'conflicts = [[{{ package = "demo", {kind} = "new" }}, {{ package = "demo", {kind} = "old" }}]]\n'
+        f'[[package]]\nname = "demo"\nversion = "0.1.0"\nsource = {{ virtual = "." }}\n'
+        "dependencies = [\n"
+        f"    {OLD_172}, marker = \"extra == '{old}'\" }},\n"
+        f"    {NEW_2101}, marker = \"extra == '{new}' or extra != '{old}'\" }},\n]\n"
+        f"[package.{table}]\nnew = [{NEW_2101} }}]\nold = [{OLD_172} }}]\n"
+        + PORTALOCKER.format(
+            old=f"(sys_platform == 'win32' and extra == '{old}') or (extra == '{new}' and extra == '{old}')",
+            new=f"(sys_platform == 'win32' and extra == '{new}') or (sys_platform == 'win32' and extra != '{old}') "
+            f"or (extra == '{new}' and extra == '{old}')",
+        )
+    )
+
+
+def needed(tmp_path, lock, selection=None, pyproject=None):
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    if pyproject is not None:
+        (tmp_path / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    sources = load_inputs([str(tmp_path / "uv.lock")])
+    if selection is not None:
+        select_uv_dependencies(sources, selection)
+    targets = build_targets(["3.13"], ["linux-x86_64", "win-amd64"])
+    rows = check(sources, targets)
+    return {
+        t.platform: {f"{r.package.name} {r.package.version}" for r in rows if r.results[t].value != "n/a"}
+        for t in targets
+    }
+
+
+BOTH = {"portalocker 1.7.1", "portalocker 2.10.1"}
+
+
+@pytest.mark.parametrize(
+    ("selection", "linux"),
+    [
+        # Every extra: each way of turning on none or one side, as `uv sync --all-extras --no-extra ...` installs.
+        (None, BOTH),
+        (UvSelection(all_extras=True), BOTH),  # uv refuses both sides, so the same
+        (UvSelection(), {"portalocker 2.10.1"}),  # plain `uv sync`
+        (UvSelection(extras=frozenset({"new"})), {"portalocker 2.10.1"}),
+        (UvSelection(extras=frozenset({"old"})), {"portalocker 1.7.1"}),  # only the extra's portalocker
+    ],
+)
+def test_uv_conflict_markers_are_evaluated_as_uv_does(tmp_path, selection, linux):
+    # pywin32's only clause off Windows needs both extras on, which uv never installs (and wheelgap used to count).
+    assert needed(tmp_path, conflict_lock("extra"), selection) == {
+        "linux-x86_64": linux,
+        "win-amd64": {*linux, "pywin32 312"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("selection", "linux"),
+    [
+        (None, BOTH),
+        (UvSelection(no_dev=True), {"portalocker 2.10.1"}),  # the default group new: `uv sync --no-dev`
+        (UvSelection(only_groups=frozenset({"old"})), {"portalocker 1.7.1"}),  # `uv sync --only-group old`
+    ],
+)
+def test_uv_conflicting_groups(tmp_path, selection, linux):
+    pyproject = '[project]\nname = "demo"\nversion = "0.1.0"\n[tool.uv]\ndefault-groups = ["new"]\n'
+    found = needed(tmp_path, conflict_lock("group"), selection, pyproject)
+    assert found == {"linux-x86_64": linux, "win-amd64": {*linux, "pywin32 312"}}
+
+
+# A workspace (uv lock, uv 0.13.1) whose project asks for `lib[cpu]`, where lib's extras cpu and gpu conflict. uv
+# counts an edge's own extras as on for its marker, and turns them on for the whole install, so any install with gpu
+# also has cpu, which `uv sync` refuses ("Found conflicting extras `lib[cpu]` and `lib[gpu]` enabled
+# simultaneously"): no install has portalocker 2.10.1.
+WORKSPACE_CONFLICT_LOCK = (
+    """
+version = 1
+revision = 5
+requires-python = ">=3.12"
+conflicts = [[{ package = "lib", extra = "cpu" }, { package = "lib", extra = "gpu" }]]
+[manifest]
+members = ["app", "lib"]
+[[package]]
+name = "app"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [{ name = "lib" }, { name = "lib", extra = ["cpu"], marker = "extra == 'extra-3-lib-cpu'" }]
+[[package]]
+name = "lib"
+version = "0.1.0"
+source = { editable = "lib" }
+[package.optional-dependencies]
+"""
+    + f"cpu = [{OLD_172} }}]\ngpu = [{NEW_2101} }}]\n"
+    + PORTALOCKER.format(old="sys_platform == 'win32'", new="sys_platform == 'win32'")
+)
+
+
+def test_uv_conflict_turned_on_by_an_edge(tmp_path):
+    assert needed(tmp_path, WORKSPACE_CONFLICT_LOCK) == {
+        "linux-x86_64": {"portalocker 1.7.1"},
+        "win-amd64": {"portalocker 1.7.1", "pywin32 312"},
+    }
+
+
+@pytest.mark.parametrize(
+    "conflicts",
+    [
+        # A conflict between projects, which leaves members out of an install: not worked out, so unknown as before.
+        'conflicts = [[{ package = "demo" }, { package = "other" }]]',
+        'conflicts = [[{ package = "demo", extra = "new", group = "old" }]]',  # not a shape uv writes
+        "conflicts = 5",
+    ],
+)
+def test_uv_conflicts_wheelgap_cannot_work_out_stay_unknown(tmp_path, conflicts):
+    lock = conflict_lock("extra").replace(conflict_lock("extra").splitlines()[3], conflicts)
+    assert needed(tmp_path, lock)["linux-x86_64"] == {*BOTH, "pywin32 312"}
+
+
+# uv sync evaluates a root's group edges before its first walk, so an extra that an edge turns on later (lib[cpu]) is
+# still off for them (to_resolution_from_packages; its TODO). uv 0.13.1 writes this lock for a project that asks for
+# lib[cpu] and has a dev group needing portalocker, which lib's cpu and gpu extras pin apart, and `uv sync --dry-run`
+# plans both portalockers: 1.7.1 through lib[cpu] and 2.10.1 through the dev group.
+GROUP_BEFORE_WALK_LOCK = (
+    """
+version = 1
+revision = 5
+requires-python = ">=3.12"
+conflicts = [[{ package = "lib", extra = "cpu" }, { package = "lib", extra = "gpu" }]]
+[manifest]
+members = ["app", "lib"]
+[[package]]
+name = "app"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [{ name = "lib", extra = ["cpu"], marker = "extra == 'extra-3-lib-cpu'" }]
+[package.dev-dependencies]
+"""
+    + f"dev = [{OLD_172}, marker = \"extra == 'extra-3-lib-cpu'\" }}, "
+    + f"{NEW_2101}, marker = \"extra == 'extra-3-lib-gpu' or extra != 'extra-3-lib-cpu'\" }}]\n"
+    + """
+[[package]]
+name = "lib"
+version = "0.1.0"
+source = { editable = "lib" }
+[package.optional-dependencies]
+"""
+    + f"cpu = [{OLD_172} }}]\ngpu = [{NEW_2101} }}]\n"
+    + PORTALOCKER.format(old="sys_platform == 'win32'", new="sys_platform == 'win32'")
+)
+
+
+@pytest.mark.parametrize("selection", [None, UvSelection()])
+def test_uv_group_edges_see_only_the_roots_items(tmp_path, selection):
+    assert needed(tmp_path, GROUP_BEFORE_WALK_LOCK, selection)["linux-x86_64"] == BOTH
+
+
+def test_uv_project_conflict_markers_stay_unknown(tmp_path):
+    # `{ package = "a" }` conflicts: uv writes `extra == 'project-1-a'`, which used to read as false, hiding every
+    # package (`uv sync --package a` and `--package b` install them).
+    lock = (
+        'version = 1\nrevision = 5\nrequires-python = ">=3.12"\n'
+        'conflicts = [[{ package = "a" }, { package = "b" }]]\n[manifest]\nmembers = ["a", "b", "root"]\n'
+        '[[package]]\nname = "root"\nversion = "0.1.0"\nsource = { virtual = "." }\n'
+        f'[[package]]\nname = "a"\nversion = "0.1.0"\nsource = {{ editable = "a" }}\n'
+        f"dependencies = [{OLD_172}, marker = \"extra == 'project-1-a'\" }}]\n"
+        f'[[package]]\nname = "b"\nversion = "0.1.0"\nsource = {{ editable = "b" }}\n'
+        f"dependencies = [{NEW_2101}, marker = \"extra == 'project-1-b'\" }}]\n"
+        + PORTALOCKER.format(old="sys_platform == 'win32'", new="sys_platform == 'win32'")
+    )
+    assert needed(tmp_path, lock)["linux-x86_64"] == BOTH
+
+
+def test_uv_conflict_names():
+    # uv's own examples: `extra-3-foo-x1` (universal_marker.rs), names normalized first.
+    assert uv_conflict_name("foo", "extra", "x1") == "extra-3-foo-x1"
+    assert uv_conflict_name("Real_Time.Voice", "group", "Dev_Tools") == "group-15-real-time-voice-dev-tools"
+    assert uv_conflict_name("demo", "project") == "project-4-demo"
 
 
 def test_no_dev_checks_runtime_without_unrequested_optional_packages(fixtures):
@@ -1976,6 +2184,74 @@ def test_script_lock_diff(tmp_path, capsys, fake_pypi):
     assert fake_pypi == []
 
 
+@pytest.mark.parametrize("name", ["forked.py.lock", "uv.lock"])
+def test_script_lock_forks_apply_where_uv_installs_them(fixtures, tmp_path, capsys, fake_pypi, name):
+    # `uv lock --script forked.py` (uv 0.13.9) forks numpy per Python and packaging per platform. `uv export --script`
+    # installs numpy 2.4.6 on < 3.12 and 2.5.5 on >= 3.12, packaging 26.4 on Linux and 23.2 elsewhere: each entry is
+    # n/a where uv takes the other, instead of a false `source` gap (#703). The same lock renamed to uv.lock is read
+    # the same way: uv picks a manifest requirement's fork by the package's resolution-markers in any lock.
+    lock = tmp_path / name
+    shutil.copyfile(fixtures / "uvscript" / "forked.py.lock", lock)
+    assert main([str(lock), "-p", "3.11,3.15", "-t", "linux-x86_64,macos-arm64", "--json"]) == 0
+    packages = json.loads(capsys.readouterr().out)["packages"]
+    linux_11, mac_11, linux_15, mac_15 = (
+        "3.11 linux-x86_64",
+        "3.11 macos-arm64",
+        "3.15 linux-x86_64",
+        "3.15 macos-arm64",
+    )
+    assert {(p["name"], p["version"]): p["results"] for p in packages} == {
+        ("numpy", "2.4.6"): {linux_11: "wheel", mac_11: "wheel", linux_15: "n/a", mac_15: "n/a"},
+        ("numpy", "2.5.5"): {linux_11: "n/a", mac_11: "n/a", linux_15: "wheel", mac_15: "wheel"},
+        ("packaging", "23.2"): {linux_11: "n/a", mac_11: "wheel", linux_15: "n/a", mac_15: "wheel"},
+        ("packaging", "26.4"): {linux_11: "wheel", mac_11: "n/a", linux_15: "wheel", mac_15: "n/a"},
+    }
+    assert fake_pypi == []
+
+
+def test_virtual_workspace_group_forks_apply_where_uv_installs_them(fixtures, capsys, fake_pypi):
+    # A virtual workspace root (`[tool.uv.workspace] members = []`, `[dependency-groups] dev = ["numpy>=1.26"]`, `uv
+    # lock --python 3.11` with uv 0.13.9) has only the manifest's group edges, which name numpy without a version.
+    # `uv sync --frozen` installs 2.4.6 on 3.11 and 2.5.5 on 3.12 and later, so neither is a gap on the other Python.
+    assert main([str(fixtures / "uvvirtualfork"), "-p", "3.11,3.13", "-t", "linux-x86_64", "--json"]) == 0
+    packages = json.loads(capsys.readouterr().out)["packages"]
+    assert {(p["name"], p["version"]): p["results"] for p in packages} == {
+        ("numpy", "2.4.6"): {"3.11 linux-x86_64": "wheel", "3.13 linux-x86_64": "n/a"},
+        ("numpy", "2.5.5"): {"3.11 linux-x86_64": "n/a", "3.13 linux-x86_64": "wheel"},
+    }
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    ("markers", "expected"),
+    [
+        # A marker the target can't decide counts as holding, so the entry is still checked.
+        (("platform_release >= '6'", "platform_release < '6'"), {"3.1", "3.2"}),
+        # No entry's markers hold (uv fails: MissingRootPackage): every entry is checked, as before.
+        (("sys_platform == 'win32'", "sys_platform == 'darwin'"), {"3.1", "3.2"}),
+        # An entry without resolution-markers fits anywhere.
+        (("sys_platform == 'darwin'", None), {"3.2"}),
+    ],
+)
+def test_script_lock_fork_markers_never_hide_an_entry(tmp_path, markers, expected):
+    entries = []
+    for version, marker in zip(("3.1", "3.2"), markers, strict=True):
+        forks = f'resolution-markers = ["{marker}"]\n' if marker else ""
+        entries.append(
+            f'[[package]]\nname = "purewheel"\nversion = "{version}"\nsource = {{ registry = "{_PYPI}" }}\n{forks}'
+            f'wheels = [{{ url = "{_FILES}/purewheel-{version}-py3-none-any.whl", hash = "sha256:00" }}]\n'
+        )
+    lock = tmp_path / "example.py.lock"
+    lock.write_text(
+        'version = 1\nrevision = 3\nrequires-python = ">=3.12"\n\n'
+        '[manifest]\nrequirements = [{ name = "purewheel" }]\n\n' + "\n".join(entries),
+        encoding="utf-8",
+    )
+    sources = load_inputs([str(lock)])
+    results = check(sources, build_targets(["3.13"], ["linux-x86_64"]))
+    assert {r.package.version for r in results if r.needed} == expected
+
+
 @pytest.mark.parametrize("setting", ['no-binary-package = ["purewheel"]', "no-build = true"])
 def test_script_lock_refused_when_its_script_sets_build_restrictions(tmp_path, capsys, fake_pypi, setting):
     (tmp_path / "example.py").write_text(
@@ -2064,3 +2340,76 @@ def test_script_lock_ignores_the_default_groups_of_a_pyproject_beside_it(tmp_pat
     packages = json.loads(capsys.readouterr().out)["packages"]
     assert [(p["name"], p["results"]) for p in packages] == [("purewheel", {"win-arm64": "wheel"})]
     assert fake_pypi == []
+
+
+EMPTY_UV_LOCK = 'version = 1\nrevision = 3\nrequires-python = ">=3.11"\n'
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [UvSelection(no_dev=True), UvSelection(all_extras=True), UvSelection(), UvSelection(all_extras=True, no_dev=True)],
+)
+def test_empty_lock_with_a_selection_has_nothing_to_install(tmp_path, selection):
+    # Textualize/textual's uv.lock (a Poetry project, locked by uv with nothing in it): `uv sync --no-dev` or
+    # `--all-extras` installs nothing, so neither does wheelgap, instead of refusing the selection.
+    (tmp_path / "uv.lock").write_text(EMPTY_UV_LOCK, encoding="utf-8")
+    sources = load_inputs([str(tmp_path / "uv.lock")])
+    select_uv_dependencies(sources, selection)
+    assert [p.name for source in sources for p in source.packages] == []
+
+
+@pytest.mark.parametrize(
+    "selection, message",
+    [
+        (UvSelection(extras=frozenset({"syntax"})), "unknown extras: syntax"),
+        (UvSelection(groups=frozenset({"dev"})), "unknown groups: dev"),
+        (UvSelection(only_groups=frozenset({"dev"})), "unknown groups: dev"),
+    ],
+)
+def test_empty_lock_naming_an_extra_or_group_is_an_error(tmp_path, selection, message):
+    # uv sync --extra syntax: "Extra `syntax` is not defined in any project's `optional-dependencies` table".
+    (tmp_path / "uv.lock").write_text(EMPTY_UV_LOCK, encoding="utf-8")
+    with pytest.raises(SourceError, match=message):
+        select_uv_dependencies(load_inputs([str(tmp_path / "uv.lock")]), selection)
+
+
+def test_cli_empty_lock_with_no_dev_has_no_packages_to_check(tmp_path, capsys, fake_pypi):
+    (tmp_path / "uv.lock").write_text(EMPTY_UV_LOCK, encoding="utf-8")
+    assert main([str(tmp_path / "uv.lock"), "--no-dev", "-p", "3.13", "-t", "linux-x86_64"]) == 0
+    assert "No packages to check" in capsys.readouterr().out
+    assert fake_pypi == []
+
+
+# `[dependency-groups] dev = []` and no [project]: uv lock writes the groups to the manifest and no packages.
+GROUPS_ONLY_UV_LOCK = EMPTY_UV_LOCK + "\n[manifest.dependency-groups]\ndev = []\nlint = []\n"
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        UvSelection(groups=frozenset({"dev"})),
+        UvSelection(only_groups=frozenset({"lint"})),
+        UvSelection(no_dev=True, groups=frozenset({"lint"})),
+    ],
+)
+def test_empty_lock_with_manifest_groups_selects_them(tmp_path, selection):
+    # uv sync --group dev / --only-group lint on that lock: "Would make no changes", not an unknown group.
+    (tmp_path / "uv.lock").write_text(GROUPS_ONLY_UV_LOCK, encoding="utf-8")
+    sources = load_inputs([str(tmp_path / "uv.lock")])
+    select_uv_dependencies(sources, selection)
+    assert [p.name for source in sources for p in source.packages] == []
+
+
+def test_empty_lock_with_manifest_groups_still_rejects_other_groups(tmp_path):
+    (tmp_path / "uv.lock").write_text(GROUPS_ONLY_UV_LOCK, encoding="utf-8")
+    with pytest.raises(SourceError, match="unknown groups: docs"):
+        select_uv_dependencies(load_inputs([str(tmp_path / "uv.lock")]), UvSelection(groups=frozenset({"docs"})))
+
+
+def test_empty_lock_with_an_unknown_default_group_is_an_error(tmp_path):
+    # uv sync --no-dev: "Default group `nope` (from `tool.uv.default-groups`) is not defined in the project's
+    # `dependency-groups` table", whatever the flags.
+    (tmp_path / "uv.lock").write_text(EMPTY_UV_LOCK, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text('[tool.uv]\ndefault-groups = ["nope"]\n', encoding="utf-8")
+    with pytest.raises(SourceError, match="unknown default groups: nope"):
+        select_uv_dependencies(load_inputs([str(tmp_path / "uv.lock")]), UvSelection(no_dev=True))

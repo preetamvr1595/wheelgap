@@ -377,6 +377,297 @@ def test_quiet_still_reports_bad_input(capsys, fixtures):
     assert code == 2 and not out and "no lockfile found" in err
 
 
+def test_requirements_line_pip_cant_split_exits_2(capsys, tmp_path, fake_pypi):
+    req = tmp_path / "requirements.txt"
+    req.write_text("fastlib==2.0.0\n-r 'unclosed\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req))
+    assert code == 2 and not out and not fake_pypi
+    assert "requirements.txt" in err and "-r 'unclosed" in err
+
+
+def test_requirements_missing_include_exits_2_with_the_line(capsys, fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("purewheel==3.1\n-r _base.txt\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert (code, out, err) == (2, "", "wheelgap: error: requirements.txt:2: -r _base.txt: file not found\n")
+    assert fake_pypi == []
+    code, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 2
+    assert json.loads(out)["error"]["message"] == "requirements.txt:2: -r _base.txt: file not found"
+
+
+def test_requirement_line_no_binary_is_honoured_as_pip_does(capsys, fake_pypi, tmp_path):
+    # pip 26.3 takes no wheel for either here: --no-binary after a requirement counts for the whole install.
+    # (The fake purewheel has no sdist, so with its wheel ruled out nothing is left.)
+    req = tmp_path / "requirements.txt"
+    req.write_text("purewheel==3.1\nfastlib==2.0.0 --no-binary purewheel,fastlib\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    results = {p["name"]: p["results"]["linux-x86_64"] for p in json.loads(out)["packages"]}
+    assert results == {"fastlib": "source", "purewheel": "missing"} and code == 1
+    req.write_text("purewheel==3.1\nfastlib==2.0.0\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    results = {p["name"]: p["results"]["linux-x86_64"] for p in json.loads(out)["packages"]}
+    assert results == {"fastlib": "wheel", "purewheel": "wheel"} and code == 0
+
+
+def test_requirements_hashes_filter_files_by_sha256(capsys, fake_pypi, tmp_path):
+    # 1. only the sdist's hash -> reports source
+    req1 = tmp_path / "req1.txt"
+    req1.write_text("hashpkg==1.0 --hash=sha256:3333333333333333333333333333333333333333333333333333333333333333\n")
+    code, out, _ = run(capsys, str(req1), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    pkg = json.loads(out)["packages"][0]
+    assert code == 1 and pkg["results"]["linux-x86_64"] == "source"
+
+    # 2. the wheel's and the sdist's -> reports wheel (as today)
+    req2 = tmp_path / "req2.txt"
+    req2.write_text(
+        "hashpkg==1.0 \\\n"
+        "    --hash=sha256:1111111111111111111111111111111111111111111111111111111111111111 \\\n"
+        "    --hash=sha256:3333333333333333333333333333333333333333333333333333333333333333\n"
+    )
+    code, out, _ = run(capsys, str(req2), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    pkg = json.loads(out)["packages"][0]
+    assert code == 0 and pkg["results"]["linux-x86_64"] == "wheel"
+
+    # 3. only a Windows wheel's hash, checked on Linux -> reports missing
+    req3 = tmp_path / "req3.txt"
+    req3.write_text("hashpkg==1.0 --hash=sha256:2222222222222222222222222222222222222222222222222222222222222222\n")
+    code, out, _ = run(capsys, str(req3), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    pkg = json.loads(out)["packages"][0]
+    assert code == 1 and pkg["results"]["linux-x86_64"] == "missing"
+
+    # 4. no listed hash matches -> reports unknown with the message
+    req4 = tmp_path / "req4.txt"
+    req4.write_text("hashpkg==1.0 --hash=sha256:9999999999999999999999999999999999999999999999999999999999999999\n")
+    code, out, _ = run(capsys, str(req4), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    pkg = json.loads(out)["packages"][0]
+    assert code == 1 and pkg["results"]["linux-x86_64"] == "unknown"
+    assert "none of the hashes in req4.txt matches a file of hashpkg 1.0" in pkg["error"]
+
+    # 5. no hashes at all -> reports wheel (unchanged)
+    req5 = tmp_path / "req5.txt"
+    req5.write_text("hashpkg==1.0\n")
+    code, out, _ = run(capsys, str(req5), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    pkg = json.loads(out)["packages"][0]
+    assert code == 0 and pkg["results"]["linux-x86_64"] == "wheel"
+
+
+def test_requirement_line_option_pip_ignores_is_a_note(capsys, fake_pypi, tmp_path):
+    # xai-org/grok-1's requirements.txt has `jax[cuda12-pip]==0.4.25 -f https://...`: pip 26.3 ignores the -f there
+    # and installs the requirement from PyPI, so wheelgap checks it on PyPI and says it left the option out.
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "purewheel==3.1\nfastlib[extra]==2.0.0 -f https://user:secret@example.invalid/wheels.html\n"
+        "nowheels==0.9 --find-links ./w\n",
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    results = {p["name"]: p["results"]["linux-x86_64"] for p in json.loads(out)["packages"]}
+    assert results == {"purewheel": "wheel", "fastlib": "wheel", "nowheels": "source"} and code == 1
+    assert err.count("wheelgap: note: requirements.txt:2: pip ignores -f after a requirement\n") == 1
+    assert "--find-links" not in err and "secret" not in err and "example.invalid" not in err
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "-q")
+    assert code == 1 and "pip ignores" not in err
+
+
+def _prelib(capsys, tmp_path, text, *argv):
+    req = tmp_path / "requirements.txt"
+    req.write_text(text, encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-t", "linux-x86_64", "--json", *argv)
+    return code, json.loads(out)["packages"] if code in (0, 1) else None, err
+
+
+@pytest.mark.parametrize("argv", [["-p", "3.13"], ["-p", "3.12,3.13"]])
+@pytest.mark.parametrize(
+    ("text", "version", "status"),
+    [
+        # pip 26.3: `--pre` then `demo>=0.5` installs demo-2.0rc1; without it, demo-1.0 (#634).
+        ("prelib>=0.5\n", "1.0", "wheel"),
+        ("--pre\nprelib>=0.5\n", "2.0rc1", "source"),
+        ("prelib>=0.5\n--pre\n", "2.0rc1", "source"),
+        ("prelib\n", "1.0", "wheel"),
+        ("--pre\nprelib\n", "2.0rc1", "source"),  # a bare name too
+        ("--all-releases prelib\nprelib\n", "2.0rc1", "source"),
+        ("--pre\n--only-final prelib\nprelib>=0.5\n", "1.0", "wheel"),
+        ("--pre\nprelib==1.0\n", "1.0", "wheel"),  # a pin isn't affected
+        ("--pre -r base.txt\n", "1.0", "wheel"),  # pip ignores --pre on a -r line
+        ("--pre -e ./local\nprelib>=0.5\n", "1.0", "wheel"),  # and on a -e line, a requirement line to pip
+        ("-e ./local --all-releases prelib\nprelib>=0.5\n", "2.0rc1", "source"),  # its parser applies this one
+    ],
+)
+def test_requirements_pre_picks_the_release_pip_installs(capsys, fake_pypi, tmp_path, text, version, status, argv):
+    (tmp_path / "base.txt").write_text("prelib>=0.5\n", encoding="utf-8")
+    code, packages, err = _prelib(capsys, tmp_path, text, *argv)
+    (pkg,) = packages
+    assert code == (1 if status == "source" else 0)
+    labels = [label for label in pkg["results"]]
+    assert {pkg["results"][label] for label in labels} == {status}
+    versions = {pkg["version"]} if "versions" not in pkg else set(pkg["versions"].values())
+    assert versions == {version}
+    if text != "--pre\nprelib==1.0\n":
+        assert "unpinned package (prelib), so the newest matching release was checked" in err
+
+
+def test_requirements_pre_on_a_simple_index(capsys, fake_simple, tmp_path):
+    code, packages, _ = _prelib(
+        capsys, tmp_path, "--pre\nprelib>=0.5\n", "-p", "3.13", "--index-url", "https://simple.example/simple"
+    )
+    assert code == 1 and packages[0]["version"] == "2.0rc1" and packages[0]["results"]["linux-x86_64"] == "source"
+    code, packages, _ = _prelib(
+        capsys, tmp_path, "prelib>=0.5\n", "-p", "3.13", "--index-url", "https://simple.example/simple"
+    )
+    assert code == 0 and packages[0]["version"] == "1.0"
+
+
+def test_requirements_no_binary_on_an_editable_line(capsys, fake_pypi, tmp_path):
+    # pip 26.3's parser callback applies `-e ./local --no-binary demo` to the whole install, though the line is a
+    # requirement to pip: with only wheels on the index it finds no demo.
+    code, packages, _ = _prelib(capsys, tmp_path, "-e ./local --no-binary prelib\nprelib==1.0\n", "-p", "3.13")
+    (pkg,) = [p for p in packages if p["name"] == "prelib"]
+    assert code == 1 and pkg["results"]["linux-x86_64"] == "source"
+
+
+def test_requirements_only_final_refuses_a_pinned_pre_release(capsys, fake_pypi, tmp_path):
+    code, packages, _ = _prelib(capsys, tmp_path, "--only-final :all:\nprelib==2.0rc1\n", "-p", "3.13")
+    assert code == 1 and packages[0]["results"]["linux-x86_64"] == "unknown"
+    assert "pip installs only final releases of prelib here (--only-final)" in packages[0]["error"]
+
+
+@pytest.mark.parametrize(
+    ("text", "noted"),
+    [
+        ("--prefer-binary\nprelib>=0.5\n", True),
+        ("--prefer-binary\nprelib\n", True),
+        ("--prefer-binary\nprelib==1.0\n", False),  # pinned: pip installs that release, wheel or not
+        ("prelib>=0.5\n", False),
+        ("prelib>=0.5 --prefer-binary\n", False),  # pip ignores it after a requirement (another note says so)
+    ],
+)
+def test_requirements_prefer_binary_note_only_for_unpinned(capsys, fake_pypi, tmp_path, text, noted):
+    code, _, err = _prelib(capsys, tmp_path, text, "-p", "3.13")
+    note = (
+        "wheelgap: note: requirements.txt:1 sets --prefer-binary: for an unpinned requirement pip may take an older "
+        "release that has a wheel, and wheelgap checked the newest\n"
+    )
+    assert code == 0 and (note in err) is noted
+    _, _, err = _prelib(capsys, tmp_path, text, "-p", "3.13", "-q")
+    assert "--prefer-binary:" not in err
+
+
+@pytest.mark.parametrize(
+    ("line", "named"),
+    [("--pre", "base.txt:1 sets --pre"), ("--prefer-binary", "base.txt:1 sets --prefer-binary")],
+)
+def test_requirements_deps_refuses_pre_and_prefer_binary(capsys, fake_pypi, tmp_path, line, named):
+    (tmp_path / "base.txt").write_text(f"{line}\nprelib>=0.5\n", encoding="utf-8")
+    code, _, err = _prelib(capsys, tmp_path, "-r base.txt\n", "-p", "3.13", "--deps")
+    assert code == 2
+    assert (
+        f"requirements.txt: --deps can't follow this the way pip does ({named}, which changes the releases pip "
+        "picks for dependencies), so check a lockfile instead"
+    ) in err
+
+
+_INDEX_NOTE = (
+    "wheelgap: note: requirements.txt sets {}, which wheelgap doesn't read: its packages were checked on PyPI only, "
+    "so a package pip finds elsewhere may install differently\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("lines", "named"),
+    [
+        # PyTorch's install instructions: pip 26.3 installs torch-2.9.0+cpu for win_arm64 from the other index.
+        (["--extra-index-url https://user:secret@example.invalid/whl/cpu"], "--extra-index-url"),
+        (["-i https://user:secret@example.invalid/simple"], "--index-url"),
+        (["-ihttps://user:secret@example.invalid/simple"], "--index-url"),
+        (["--index-url=https://user:secret@example.invalid/simple"], "--index-url"),
+        (["--extra https://user:secret@example.invalid/simple"], "--extra-index-url"),  # optparse's abbreviation
+        (["--find-links ./wheels"], "--find-links"),
+        (["-f https://user:secret@example.invalid/wheels.html"], "--find-links"),
+        (["--no-index", "--find-links=./wheels"], "--no-index and --find-links"),
+        (
+            ["-i https://user:secret@example.invalid/a", "--extra-index-url https://example.invalid/b", "-f ./w"],
+            "--index-url, --extra-index-url and --find-links",
+        ),
+        (
+            ["--extra-index-url https://example.invalid/a", "--extra-index-url https://example.invalid/b"],
+            "--extra-index-url",
+        ),
+        (["--pre --extra-index-url https://user:secret@example.invalid/simple"], "--extra-index-url"),
+        (["--pypi-url https://user:secret@example.invalid/simple"], "--pypi-url"),  # pip's other name for -i
+    ],
+)
+def test_requirements_index_option_is_a_note(capsys, fake_pypi, tmp_path, lines, named):
+    # pip reads these lines and installs from the index or folder they name; wheelgap checks PyPI only (#632). The
+    # report is unchanged, and stderr says so, by the option's name only: its value may hold credentials.
+    req = tmp_path / "requirements.txt"
+    req.write_text("\n".join([*lines, "purewheel==3.1", ""]), encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 0 and json.loads(out)["packages"][0]["results"]["linux-x86_64"] == "wheel"
+    assert err.count(_INDEX_NOTE.format(named)) == 1
+    assert "secret" not in err and "example.invalid" not in err and "./w" not in err
+    code, _, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "-q")
+    assert code == 0 and "doesn't read" not in err  # -q drops it, as it drops the unpinned-package note
+
+
+def test_requirements_index_option_in_an_included_file_is_a_note(capsys, fake_pypi, tmp_path):
+    (tmp_path / "base.txt").write_text("--find-links https://user:secret@example.invalid/w.html\npurewheel==3.1\n")
+    req = tmp_path / "requirements.txt"
+    req.write_text("-r base.txt\nfastlib==2.0.0\n", encoding="utf-8")
+    code, _, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 0 and err.count(_INDEX_NOTE.format("--find-links")) == 1  # one note per input, named by its label
+    assert "secret" not in err
+
+
+def test_requirements_without_index_option_has_no_index_note(capsys, fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    # --trusted-host names no index, nor does its value; an -f after a requirement is ignored by pip (its own note
+    # says so), and so is an index option on a line with -r or -c: pip 26.3 reads the file and drops the rest.
+    (tmp_path / "base.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "c.txt").write_text("", encoding="utf-8")
+    req.write_text(
+        "--trusted-host -ifoo\n--find-links ./w -r base.txt\n-c c.txt --extra-index-url https://example.invalid/s\n"
+        "fastlib==2.0.0 -f ./w\n",
+        encoding="utf-8",
+    )
+    code, _, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 0 and "doesn't read" not in err
+    assert "requirements.txt:4: pip ignores -f after a requirement" in err
+
+
+def test_requirements_index_note_not_given_when_the_run_names_an_index(
+    capsys, fake_pypi, fake_simple, tmp_path, monkeypatch
+):
+    # With wheelgap's own --index-url (or a WHEELGAP_INDEX_URL mirror) the run doesn't check PyPI, so the note,
+    # which says it does, would be wrong.
+    req = tmp_path / "requirements.txt"
+    req.write_text("--extra-index-url https://example.invalid/simple\npurewheel==3.1\n", encoding="utf-8")
+    code, _, err = run(
+        capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--index-url", "https://simple.example/simple"
+    )
+    assert code in (0, 1) and "doesn't read" not in err
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example.com/pypi")
+    code, _, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 0 and "doesn't read" not in err
+
+
+def test_requirements_include_cycle_exits_2(capsys, tmp_path, monkeypatch):
+    # pip refuses an include cycle, so wheelgap does too: exit code 2, and the same error with
+    # --github-annotations, since the file is parsed before any line is looked up (#603).
+    c1 = tmp_path / "c1.txt"
+    c1.write_text("-r c2.txt\nrequests==2.32.5\n", encoding="utf-8")
+    (tmp_path / "c2.txt").write_text("-r c1.txt\nidna==3.11\n", encoding="utf-8")
+    message = (
+        "c2.txt: -r c1.txt includes a file that is already being read (c1.txt -> c2.txt -> c1.txt); pip refuses this"
+    )
+    code, out, err = run(capsys, str(c1))
+    assert code == 2 and not out and message in err
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    code, out, err = run(capsys, str(c1), "--github-annotations")
+    assert code == 2 and not out and message in err
+
+
 def test_quiet_preserves_fail_on_missing(capsys, fake_pypi):
     code, out, err = run(capsys, "nowheels", "-p", "3.13", "-t", "linux", "--fail-on", "missing", "--quiet")
     assert code == 0 and not err
@@ -708,6 +999,10 @@ def test_list_targets_rejects_invalid_compatibility_version(capsys):
     assert code == 2 and not out
     assert "can't parse glibc version" in err
 
+    code, out, err = run(capsys, "--list-targets", "--glibc", "2")
+    assert code == 2 and not out
+    assert "glibc version '2' needs a minor version too" in err
+
 
 def test_defaults_from_pyproject(capsys, fixtures):
     code, out, _ = run(capsys, str(fixtures / "configproj"), "--json")
@@ -747,6 +1042,46 @@ def test_missing_requirements_in_is_not_a_pypi_package(capsys, tmp_path, monkeyp
         assert not out
 
 
+@pytest.mark.parametrize("as_json", [False, True])
+def test_dockerfile_missing_path(capsys, tmp_path, monkeypatch, fake_pypi, as_json):
+    monkeypatch.chdir(tmp_path)
+    args = ["--dockerfile", "nope"]
+    if as_json:
+        args.append("--json")
+    code, out, err = run(capsys, *args)
+    assert code == 2
+    assert err == "wheelgap: error: --dockerfile nope: no such file\n"
+    assert not fake_pypi
+    if as_json:
+        assert json.loads(out)["error"] == {
+            "message": "--dockerfile nope: no such file",
+            "type": "DockerfileError",
+        }
+    else:
+        assert not out
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_dockerfile_folder(capsys, tmp_path, monkeypatch, fake_pypi, as_json):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docker").mkdir()
+    args = ["--dockerfile", "docker"]
+    if as_json:
+        args.append("--json")
+    code, out, err = run(capsys, *args)
+    assert code == 2
+    expected = "--dockerfile docker: is a folder; pass the Dockerfile in it, e.g. docker/Dockerfile"
+    assert err == f"wheelgap: error: {expected}\n"
+    assert not fake_pypi
+    if as_json:
+        assert json.loads(out)["error"] == {
+            "message": expected,
+            "type": "DockerfileError",
+        }
+    else:
+        assert not out
+
+
 def test_json_reports_input_errors_on_stdout(capsys, fixtures, tmp_path):
     def json_error(*argv):
         code, out, err = run(capsys, *argv, "--json")
@@ -762,6 +1097,21 @@ def test_json_reports_input_errors_on_stdout(capsys, fixtures, tmp_path):
     error = json_error(missing)
     assert set(error) == {"message", "type"} and "nonexistent.lock" in error["message"]
     assert plain_out(missing) == ""
+
+    missing_dockerfile = str(tmp_path / "nonexistent_dockerfile")
+    error = json_error("--dockerfile", missing_dockerfile)
+    assert error == {
+        "message": f"--dockerfile {missing_dockerfile}: no such file",
+        "type": "DockerfileError",
+    }
+    assert plain_out("--dockerfile", missing_dockerfile) == ""
+
+    (tmp_path / "docker_dir").mkdir()
+    error = json_error("--dockerfile", str(tmp_path / "docker_dir"))
+    assert set(error) == {"message", "type"}
+    assert error["type"] == "DockerfileError"
+    assert "is a folder; pass the Dockerfile in it" in error["message"]
+    assert plain_out("--dockerfile", str(tmp_path / "docker_dir")) == ""
 
     error = json_error("six", "-t", "nosuchplatform")
     assert error["type"] == "TargetError" and "nosuchplatform" in error["message"]
@@ -863,23 +1213,34 @@ def test_empty_python_flag_is_an_error(capsys, fixtures, flag, as_json):
         assert not out
 
 
+@pytest.mark.parametrize("python", ['""', '["3.13", ""]', '","', '["3.13", " , "]'])
 @pytest.mark.parametrize("as_json", [False, True])
-def test_empty_python_in_config_is_an_error(capsys, fixtures, tmp_path, as_json):
+def test_empty_python_in_config_is_an_error(capsys, fixtures, tmp_path, as_json, python):
     project = project_with_lock(tmp_path, fixtures)
-    (project / "pyproject.toml").write_text('[tool.wheelgap]\npython = [""]\n', encoding="utf-8")
+    (project / "pyproject.toml").write_text(f"[tool.wheelgap]\npython = {python}\n", encoding="utf-8")
     args = [str(project), "-t", "linux-x86_64"]
     if as_json:
         args.append("--json")
     code, out, err = run(capsys, *args)
     assert code == 2
-    assert "wheelgap: error: no Python version given (-p is empty)" in err
+    # The setting is the cause, so the message names it: the run never sees -p.
+    message = '[tool.wheelgap] python is empty: remove it to use the default, or list versions like ["3.13"]'
+    assert f"wheelgap: error: {project / 'pyproject.toml'}: {message}" in err
     if as_json:
         assert json.loads(out)["error"] == {
-            "message": "no Python version given (-p is empty)",
-            "type": "TargetError",
+            "message": f"{project / 'pyproject.toml'}: {message}",
+            "type": "SourceError",
         }
     else:
         assert not out
+
+
+def test_empty_python_list_in_config_takes_the_default(capsys, fixtures, tmp_path):
+    project = project_with_lock(tmp_path, fixtures)
+    (project / "pyproject.toml").write_text("[tool.wheelgap]\npython = []\n", encoding="utf-8")
+    # An empty list is "not set", as before: the run takes the default Python rather than failing.
+    _, out, _ = run(capsys, str(project), "-t", "win-amd64", "--json")
+    assert [t["python"] for t in json.loads(out)["targets"]] == [cli.running_python()]
 
 
 @pytest.mark.parametrize("as_json", [False, True])
@@ -1335,6 +1696,21 @@ def test_requirements_constraint_picks_the_checked_release(tmp_path, fake_pypi, 
     assert "1.9" in out and "source" in out
 
 
+def test_requirements_requirement_inside_constraints_file_is_checked(tmp_path, fake_pypi, capsys):
+    # A -r inside a constraints file is requirements, not more constraints (#602): psycopg2 is
+    # checked (and builds from source here) instead of being silently skipped.
+    path = tmp_path / "a.txt"
+    path.write_text("-c cons.txt\nrequests==2.32.5\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("-r extra.txt\nurllib3<3\n", encoding="utf-8")
+    (tmp_path / "extra.txt").write_text("psycopg2==2.9.11\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(path), "-p", "3.14", "-t", "linux-x86_64", "--json")
+    assert code == 1
+    packages = {p["name"]: p for p in json.loads(out)["packages"]}
+    assert packages["psycopg2"]["results"] == {"linux-x86_64": "source"}
+    assert packages["psycopg2"]["version"] == "2.9.11"
+    assert set(packages) == {"psycopg2", "requests"}
+
+
 def test_requirements_marker_constraint_is_unknown(tmp_path, fake_pypi, capsys):
     path = tmp_path / "requirements.txt"
     path.write_text("ranged\n-c constraints.txt\n", encoding="utf-8")
@@ -1377,6 +1753,170 @@ def test_lock_inside_requires_python_stays_offline(capsys, fake_pypi, tmp_path):
     code, _, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64")
     assert code == 0 and "note:" not in err
     assert fake_pypi == []
+
+
+def environments_lock(*markers):
+    """A uv.lock as uv writes it for `[tool.uv] environments = [markers]`: the wheels for other platforms are left
+    out (uv 0.13.1 keeps only the Linux x86_64 ones for the first marker in LINUX_ONLY)."""
+    supported = "supported-markers = [\n" + "".join(f"    {json.dumps(m)},\n" for m in markers) + "]\n"
+    return LOCK_312_ONLY.replace('"==3.12.*"\n', '">=3.12"\n' + supported)
+
+
+LINUX_ONLY = ("platform_machine == 'x86_64' and sys_platform == 'linux'",)
+
+
+def test_lock_environments_refuse_a_target_outside_them(capsys, fake_pypi, tmp_path):
+    # Without the check, win-amd64 would read `source`: a gap that only says the lock left Windows out.
+    (tmp_path / "uv.lock").write_text(environments_lock(*LINUX_ONLY), encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64,win-amd64,macos-arm64")
+    assert code == 2 and out == ""
+    assert "uv.lock: this lock doesn't cover win-amd64, macos-arm64: it was locked for `[tool.uv] environments`" in err
+    assert "(platform_machine == 'x86_64' and sys_platform == 'linux'), so `uv sync` fails there" in err
+    assert "of the targets asked for it covers linux-x86_64 (" in err
+    assert fake_pypi == []
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "win-amd64", "--json")
+    assert code == 2 and "it covers none of the targets asked for" in err
+    assert "this lock doesn't cover win-amd64" in json.loads(out)["error"]["message"]
+    # --online looks the locked packages up again, but not the ones the lock left out.
+    assert run(capsys, str(tmp_path), "-p", "3.12", "-t", "win-amd64", "--online")[0] == 2
+
+
+def test_lock_environments_in_a_lock_uv_wrote(capsys, fake_pypi, fixtures):
+    code, out, err = run(capsys, str(fixtures / "uvenvironments"), "-p", "3.13", "--json")
+    data = json.loads(out)
+    assert code == 0 and [t["platform"] for t in data["targets"]] == ["linux-x86_64"]
+    assert "which leave out linux-aarch64, macos-arm64, win-amd64: checking the default targets it covers" in err
+    assert [(p["name"], p["results"]) for p in data["packages"]] == [("markupsafe", {"linux-x86_64": "wheel"})]
+    assert fake_pypi == []
+
+
+def test_lock_environments_leave_covered_targets_alone(capsys, fake_pypi, tmp_path):
+    answers = []
+    for lock in (environments_lock(*LINUX_ONLY), environments_lock()):  # the second has no limit
+        (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+        code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64", "--json")
+        assert code == 0 and "note:" not in err
+        answers.append(json.loads(out))
+    assert answers[0] == answers[1]
+    assert answers[0]["packages"][0]["results"] == {"linux-x86_64": "wheel"}
+
+
+def test_lock_environments_narrow_the_default_targets(capsys, fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(environments_lock("sys_platform == 'linux'"), encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "--json")
+    assert [t["platform"] for t in json.loads(out)["targets"]] == ["linux-x86_64", "linux-aarch64"]
+    assert (
+        "wheelgap: note: uv.lock is locked for `[tool.uv] environments` only, which leave out macos-arm64, "
+        "win-amd64: checking the default targets it covers (linux-x86_64, linux-aarch64)\n"
+    ) in err
+    assert code == 1  # the lock's own gap on linux-aarch64 still counts
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "--json", "-q")
+    assert [t["platform"] for t in json.loads(out)["targets"]] == ["linux-x86_64", "linux-aarch64"] and err == ""
+    # The same platforms asked for by name are an error, and so is a lock that covers no default target.
+    assert run(capsys, str(tmp_path), "-p", "3.12", "-t", ",".join(DEFAULT_PLATFORMS))[0] == 2
+    (tmp_path / "uv.lock").write_text(environments_lock("sys_platform == 'emscripten'"), encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.12")
+    assert code == 2 and "it covers none of the targets asked for" in err and "note:" not in err
+
+
+def test_lock_environments_narrow_the_default_targets_in_diff(capsys, fake_pypi, tmp_path):
+    old, new = tmp_path / "old" / "uv.lock", tmp_path / "new" / "uv.lock"
+    for lock in (old, new):
+        lock.parent.mkdir()
+        lock.write_text(environments_lock("sys_platform == 'linux'"), encoding="utf-8")
+    code, _, err = run(capsys, "diff", str(old), str(new), "-p", "3.12")
+    assert code == 0 and "checking the default targets it covers (linux-x86_64, linux-aarch64)" in err
+    # A platform the new lock gives up is refused, not dropped.
+    old.write_text(environments_lock(), encoding="utf-8")
+    code, _, err = run(capsys, "diff", str(old), str(new), "-p", "3.12")
+    assert code == 2 and "this lock doesn't cover macos-arm64, win-amd64" in err
+    # A side that isn't a uv.lock leaves out nothing, so nothing is dropped: what the lock gives up is refused.
+    req = tmp_path / "requirements.txt"
+    req.write_text("markupsafe==3.0.2\n", encoding="utf-8")
+    old.write_text(environments_lock("sys_platform == 'linux'"), encoding="utf-8")
+    assert run(capsys, "diff", str(req), str(new), "-p", "3.12")[0] == 2
+    assert run(capsys, "diff", str(new), str(req), "-p", "3.12")[0] == 2
+
+
+def test_lock_environments_leave_out_advisory_targets(capsys, fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(environments_lock(*LINUX_ONLY), encoding="utf-8")
+    args = ("-p", "3.12", "-t", "linux-x86_64,win-amd64", "--advisory", "win-amd64", "--json")
+    code, out, err = run(capsys, str(tmp_path), *args)
+    assert code == 0 and [t["platform"] for t in json.loads(out)["targets"]] == ["linux-x86_64"]
+    assert "which leave out the advisory targets win-amd64: not checking them" in err
+    # Asked for and required, it's still an error.
+    assert run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64,win-amd64")[0] == 2
+
+
+def test_lock_environments_narrowing_keeps_advisory_targets(capsys, fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(environments_lock("sys_platform == 'linux'"), encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.12", "--json", "--advisory", "linux-aarch64,win-amd64")
+    assert code == 0 and json.loads(out)["advisory"] == ["linux-aarch64"]
+
+
+@pytest.mark.parametrize(
+    "marker,python,covered",
+    [
+        ("python_full_version < '3.14' and sys_platform == 'linux'", "3.13", True),
+        ("python_full_version < '3.14' and sys_platform == 'linux'", "3.14", False),
+        ("python_full_version >= '3.14'", "3.13", False),
+        ("python_full_version >= '3.14'", "3.14t", True),
+        ("platform_python_implementation == 'CPython'", "3.13", True),
+        ("platform_python_implementation == 'PyPy'", "3.13", False),
+        ("implementation_name == 'cpython' and os_name == 'posix'", "3.13", True),
+        ("platform_machine == 'aarch64'", "3.13", False),
+        ("sys_platform != 'emscripten'", "3.13", True),
+        ("(sys_platform == 'darwin' or sys_platform == 'linux') and python_version < '3.14'", "3.13", True),
+    ],
+)
+def test_lock_environment_markers_are_evaluated_for_the_target(capsys, fake_pypi, tmp_path, marker, python, covered):
+    (tmp_path / "uv.lock").write_text(environments_lock(marker), encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", python, "-t", "linux-x86_64")
+    assert ("this lock doesn't cover linux-x86_64" in err) is not covered
+    assert (code == 2) is not covered
+
+
+def test_lock_environments_cover_a_target_if_any_marker_holds(capsys, fake_pypi, tmp_path):
+    lock = environments_lock("sys_platform == 'win32'", "sys_platform == 'linux'")
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.12,3.13", "-t", "linux-x86_64,win-amd64,macos-arm64")
+    assert code == 2 and "this lock doesn't cover 3.12 macos-arm64, 3.13 macos-arm64: " in err
+    assert "it covers 3.12 linux-x86_64, 3.12 win-amd64, 3.13 linux-x86_64, 3.13 win-amd64 (" in err
+
+
+def test_lock_environments_cover_a_default_platform_for_some_pythons_only(capsys, fake_pypi, tmp_path):
+    # Python 3.14 was asked for, so leaving it out quietly would hide that `uv sync` fails there.
+    lock = environments_lock("python_full_version < '3.14' and sys_platform == 'linux'")
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.13,3.14")
+    assert code == 2 and "which leave out macos-arm64, win-amd64: checking" in err
+    assert "this lock doesn't cover 3.14 linux-x86_64, 3.14 linux-aarch64: " in err
+
+
+@pytest.mark.parametrize(
+    "marker,target",
+    [
+        ("platform_release == '6.1'", "linux-x86_64"),  # nothing a target fixes
+        ("platform_machine == 'AMD64'", "win32"),  # 32-bit Python on 64-bit Windows says AMD64 or ARM64
+        ("python_full_version >= '3.12.4'", "linux-x86_64"),  # 3.12.0 no, 3.12.9 yes
+        ("not a marker", "linux-x86_64"),
+    ],
+)
+def test_lock_environments_that_a_target_cannot_decide_are_not_guessed(capsys, fake_pypi, tmp_path, marker, target):
+    (tmp_path / "uv.lock").write_text(environments_lock(marker), encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", target)
+    assert code == 2 and out == ""
+    assert f"uv.lock: can't tell whether this lock covers {target}: it was locked for" in err
+    # A marker that does hold settles it, whatever the others say.
+    (tmp_path / "uv.lock").write_text(environments_lock(marker, "os_name != 'java'"), encoding="utf-8")
+    assert run(capsys, str(tmp_path), "-p", "3.12", "-t", target)[0] != 2
+
+
+def test_lock_environments_must_be_a_list_of_markers(capsys, tmp_path):
+    lock = LOCK_312_ONLY.replace("version = 1\n", "version = 1\nsupported-markers = \"sys_platform == 'linux'\"\n", 1)
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64")
+    assert code == 2 and "uv.lock: `supported-markers` isn't a list of strings" in err
 
 
 def test_failed_recheck_keeps_the_lock_answers(capsys, tmp_path, monkeypatch):
@@ -2223,6 +2763,15 @@ def _assert_matches_output_schema(data):
     assert isinstance(data, dict)
     for key in ("version", "sources", "targets", "packages", "skipped", "ignored", "ignored_targets", "summary"):
         assert key in data
+    if "fix_summary" in data:
+        fs = data["fix_summary"]
+        assert fs["gaps"] == sum(v for k, v in fs.items() if k != "gaps")
+        kinds = [
+            e.get("reason") if e.get("reason") in ("not_looked_up", "uv_may_fork") else e["kind"]
+            for p in data["packages"]
+            for e in p.get("fix", {}).values()
+        ]
+        assert fs == {"gaps": len(kinds), **{k: kinds.count(k) for k in set(fs) - {"gaps"}}}
     assert isinstance(data["version"], str) and data["version"]
     assert isinstance(data["sources"], list) and all(isinstance(s, str) for s in data["sources"])
     assert isinstance(data["ignored"], list) and all(isinstance(s, str) for s in data["ignored"])
@@ -2260,6 +2809,8 @@ def _assert_matches_output_schema(data):
             "suggest",
             "last_with_wheel",
             "gap_wheel",
+            "fix",
+            "pip_refuses",
         }
         assert isinstance(pkg["name"], str) and pkg["name"]
         assert pkg["version"] is None or isinstance(pkg["version"], str)
@@ -2303,6 +2854,16 @@ def _assert_matches_output_schema(data):
             assert set(pkg["suggest"]) <= set(pkg["rejected"]) and all(
                 isinstance(v, str) for v in pkg["suggest"].values()
             )
+        if "fix" in pkg:  # --fix: one entry per gap target, with the keys of its kind
+            gap_labels = {k for k, v in pkg["results"].items() if v in ("source", "missing")}
+            assert set(pkg["fix"]) <= gap_labels
+            keys = {
+                "upgrade": {"version", "how", "constraint", "gap_wheel"},
+                "gap_wheel": {"wheel", "url", "sha256", "unofficial"},
+                "none": {"reason", "abi3_only"},
+            }
+            for entry in pkg["fix"].values():
+                assert set(entry) == {"kind"} | keys[entry["kind"]]
         if "gap_wheel" in pkg:
             assert set(pkg["gap_wheel"]) <= set(pkg.get("rejected", {}))
             for label, wheel in pkg["gap_wheel"].items():
@@ -2312,6 +2873,8 @@ def _assert_matches_output_schema(data):
                 assert wheel.get("install", "pip install --extra-index-url ").startswith(
                     "pip install --extra-index-url "
                 )
+        if "pip_refuses" in pkg:  # files uv installs from a uv.lock and pip would refuse: never an empty object
+            assert pkg["pip_refuses"] and all(isinstance(why, str) and why for why in pkg["pip_refuses"].values())
         if "last_with_wheel" in pkg:  # an older release for gap targets no newer one has a wheel for
             assert "suggest" in pkg and not set(pkg["last_with_wheel"]) & set(pkg["suggest"])
             assert set(pkg["last_with_wheel"]) <= set(pkg["rejected"])
@@ -2319,7 +2882,11 @@ def _assert_matches_output_schema(data):
         assert set(item) == {"name", "reason"}
         assert isinstance(item["name"], str) and isinstance(item["reason"], str)
     summary = data["summary"]
-    assert set(summary) == {"packages", "with_gaps", "per_target"}
+    # complete: only with --dockerfile-inputs, and false exactly when dockerfile_warnings lists a line.
+    assert set(summary) - {"complete"} == {"packages", "with_gaps", "per_target"}
+    assert ("complete" in summary) == ("dockerfile_warnings" in data)
+    if "complete" in summary and data["dockerfile_warnings"]:
+        assert summary["complete"] is False  # also false when -p/-t stood in for an unread image
     distinct_names = {pkg["name"] for pkg in data["packages"]}
     assert len(distinct_names) <= summary["packages"] <= len(data["packages"])
     assert isinstance(summary["with_gaps"], int) and 0 <= summary["with_gaps"] <= summary["packages"]
@@ -2784,6 +3351,28 @@ def test_pyproject_groups_without_project_errors(capsys, fake_pypi, tmp_path, te
     assert not fake_pypi
 
 
+def test_pyproject_groups_error_lists_only_valid_group_names(capsys, fake_pypi, tmp_path):
+    # The group names are text from the file: a line break and an escape code in a quoted key stay out of the error.
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        '[dependency-groups]\ntest = ["purewheel==3.1"]\n"a\\nrun this instead" = []\n"\\u001b[2J" = []\n',
+        encoding="utf-8",
+    )
+    code, _, err = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and "pick one with --group or --only-group: test" in err
+    assert "run this instead" not in err and err.rstrip("\n").isprintable()
+    assert not fake_pypi
+
+
+def test_pyproject_groups_error_without_a_valid_group_name(capsys, fake_pypi, tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text('[dependency-groups]\n"\\u001b[2J" = []\n', encoding="utf-8")
+    code, _, err = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and "no [project] table and no groups to select" in err
+    assert "\x1b" not in err and err.rstrip("\n").isprintable()
+    assert not fake_pypi
+
+
 @pytest.mark.parametrize("flag", ["--group", "--only-group"])
 @pytest.mark.parametrize(
     "text,beside",
@@ -2899,12 +3488,29 @@ def test_pyproject_self_reference_in_dependencies_is_not_looked_up(capsys, fake_
     assert not any("mylib" in url.lower() for url in fake_pypi)
 
 
-def test_directory_without_lockfile_suggests_pyproject(capsys, fake_pypi, tmp_path):
+def test_directory_without_lockfile_checks_pyproject(capsys, fake_pypi, tmp_path):
     (tmp_path / "pyproject.toml").write_text(LIB_PYPROJECT, encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 1  # as `wheelgap DIR/pyproject.toml` (tests/test_directory.py has the rest)
+    assert {row["name"] for row in json.loads(out)["packages"]} == {"ranged", "fastlib"}
+    assert f"so {tmp_path / 'pyproject.toml'} was checked" in err
+
+
+def test_directory_with_groups_only_pyproject_suggests_group(capsys, fake_pypi, tmp_path):
+    (tmp_path / "pyproject.toml").write_text(GROUPS_ONLY_PYPROJECT, encoding="utf-8")
     code, _, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
     assert code == 2
     assert "no lockfile found" in err
-    assert f"wheelgap {tmp_path / 'pyproject.toml'}" in err
+    assert f"wheelgap {tmp_path / 'pyproject.toml'} --group NAME` (groups: shared, test)." in err
+    assert not fake_pypi
+
+
+def test_directory_with_groups_only_pyproject_in_a_buildable_project_has_no_group_hint(capsys, fake_pypi, tmp_path):
+    (tmp_path / "pyproject.toml").write_text(GROUPS_ONLY_PYPROJECT, encoding="utf-8")
+    (tmp_path / "setup.py").write_text("", encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2
+    assert "no lockfile found" in err and "--group" not in err
 
 
 # --github-annotations
@@ -2973,6 +3579,33 @@ def test_github_annotations_requirements(capsys, fake_pypi, tmp_path, monkeypatc
         * 2,
         "::error file=more/extra.txt,line=2,title=winonly 311%3A can't install::"
         "winonly 311 can't install on linux-x86_64.",
+    ]
+
+
+def test_github_annotations_symlinked_requirements_file(capsys, fake_pypi, tmp_path, monkeypatch):
+    # The requirements file is a link into real/, and both folders have a base.txt: the annotation for the
+    # package pip reads (nowheels, from link/base.txt) is on link/base.txt, not real/base.txt (#604). The linked
+    # file's own line is on the file the link points to: git keeps link/reqs.txt as a link, so it has no line 2.
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").mkdir()
+    (tmp_path / "real" / "reqs.txt").write_text("-r base.txt\nranged==1.9\n", encoding="utf-8")
+    (tmp_path / "real" / "base.txt").write_text("psycopg2==2.9.11\n", encoding="utf-8")
+    (tmp_path / "link" / "base.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    try:
+        # A Path, so that Windows gets backslashes: a link written with forward slashes can't be opened there.
+        (tmp_path / "link" / "reqs.txt").symlink_to(Path("../real/reqs.txt"))
+    except OSError:
+        pytest.skip("symlinks aren't available here")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    code, out, _ = run(
+        capsys, str(tmp_path / "link" / "reqs.txt"), "-p", "3.13", "-t", "linux-x86_64", "--github-annotations"
+    )
+    assert code == 1
+    assert annotation_lines(out) == [
+        "::error file=link/base.txt,line=1,title=nowheels 0.9%3A builds from source::"
+        "nowheels 0.9 builds from source on linux-x86_64.",
+        "::error file=real/reqs.txt,line=2,title=ranged 1.9%3A builds from source::"
+        "ranged 1.9 builds from source on linux-x86_64.",
     ]
 
 
@@ -3182,6 +3815,112 @@ def test_github_annotations_fail_on_missing_mixes_levels(capsys, fake_pypi, fixt
         ("::warning", "nativeext"),
         ("::warning", "puresdist"),
     ]
+
+
+@pytest.fixture
+def dockerfile_provenance_inputs(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    Path("Dockerfile").write_text(
+        "FROM --platform=linux/amd64 python:3.13-slim\n"
+        "WORKDIR /app\n"
+        "COPY requirements.txt second.txt ./\n"
+        "RUN pip install -r requirements.txt\n"
+        "RUN pip install -r second.txt\n",
+        encoding="utf-8",
+    )
+    Path("requirements.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    Path("second.txt").write_text("psycopg2==2.9.11\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("flags", [(), ("--markdown",)])
+def test_dockerfile_input_provenance_in_report_headers(capsys, fake_pypi, dockerfile_provenance_inputs, flags):
+    code, out, err = run(capsys, "--dockerfile", "Dockerfile", "--dockerfile-inputs", *flags)
+    assert code == 1
+    assert "requirements.txt (Dockerfile:4)" in out
+    assert "second.txt (Dockerfile:5)" in out
+    assert "Dockerfile:4: RUN pip install -r reads requirements.txt" in err
+    assert "Dockerfile:5: RUN pip install -r reads second.txt" in err
+
+
+def test_dockerfile_input_provenance_in_json_and_annotations(capsys, fake_pypi, dockerfile_provenance_inputs):
+    code, out, err = run(capsys, "--dockerfile", "Dockerfile", "--dockerfile-inputs", "--json", "--github-annotations")
+    assert code == 1
+    report = json.loads(out)
+    _assert_matches_output_schema(report)
+    assert report["sources"] == ["requirements.txt", "second.txt"]
+    assert report["dockerfile_inputs"] == [
+        {"dockerfile": "Dockerfile", "line": 4, "file": "requirements.txt", "constraints": [], "includes": []},
+        {"dockerfile": "Dockerfile", "line": 5, "file": "second.txt", "constraints": [], "includes": []},
+    ]
+    assert "::error file=requirements.txt,line=1," in err
+    assert "nowheels 0.9 builds from source on linux-x86_64 (installed by Dockerfile:4)." in err
+    assert "::error file=second.txt,line=1," in err
+    assert "psycopg2 2.9.11 builds from source on linux-x86_64 (installed by Dockerfile:5)." in err
+
+
+def test_dockerfile_input_provenance_names_the_line_a_continued_run_starts_on(capsys, fake_pypi, tmp_path, monkeypatch):
+    # Docker numbers an instruction by the line it starts on; the -r here is three lines further down, and the
+    # Dockerfile sits in a folder of its own, with the build context given.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    Path("docker").mkdir()
+    Path("docker/Dockerfile").write_text(
+        "FROM --platform=linux/amd64 python:3.13-slim\n"
+        "WORKDIR /app\n"
+        "COPY requirements.txt ./\n"
+        "RUN apt-get update \\\n"
+        "    && apt-get install -y gcc\n"
+        "RUN pip install \\\n"
+        "    # the pinned set\n"
+        "    --no-cache-dir \\\n"
+        "    -r requirements.txt\n",
+        encoding="utf-8",
+    )
+    Path("requirements.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    args = ["--dockerfile", "docker/Dockerfile", "--dockerfile-inputs", "--dockerfile-context", "."]
+    code, out, err = run(capsys, *args)
+    assert code == 1 and " · requirements.txt (docker/Dockerfile:6) · 1 package · Python 3.13\n" in out
+    assert "docker/Dockerfile:6: RUN pip install -r reads requirements.txt" in err
+    code, out, err = run(capsys, *args, "--json", "--github-annotations")
+    report = json.loads(out)
+    _assert_matches_output_schema(report)
+    assert report["sources"] == ["requirements.txt"]
+    assert report["dockerfile_inputs"] == [
+        {"dockerfile": "docker/Dockerfile", "line": 6, "file": "requirements.txt", "constraints": [], "includes": []}
+    ]
+    assert "::error file=requirements.txt,line=1," in err
+    assert "nowheels 0.9 builds from source on linux-x86_64 (installed by docker/Dockerfile:6)." in err
+
+
+def test_dockerfile_inputs_file_is_relative_to_the_build_context(capsys, fake_pypi, tmp_path, monkeypatch):
+    # The Dockerfile's folder is the build context, given or not, and absolute or not: `file` is the same.
+    monkeypatch.chdir(tmp_path)
+    Path("docker/reqs").mkdir(parents=True)
+    Path("docker/Dockerfile").write_text(
+        "FROM --platform=linux/amd64 python:3.13-slim\nWORKDIR /app\nCOPY reqs/base.txt ./\n"
+        "RUN pip install -r base.txt\n",
+        encoding="utf-8",
+    )
+    Path("docker/reqs/base.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    for context in ([], ["--dockerfile-context", str(tmp_path / "docker")]):
+        _, out, _ = run(capsys, "--dockerfile", "docker/Dockerfile", "--dockerfile-inputs", "--json", *context)
+        report = json.loads(out)
+        _assert_matches_output_schema(report)
+        assert report["dockerfile_inputs"] == [
+            {"dockerfile": "docker/Dockerfile", "line": 4, "file": "reqs/base.txt", "constraints": [], "includes": []}
+        ]
+
+
+def test_no_dockerfile_inputs_key_without_the_flag(capsys, fake_pypi, dockerfile_provenance_inputs):
+    _, out, err = run(capsys, "requirements.txt", "--dockerfile", "Dockerfile", "--json", "--github-annotations")
+    assert "dockerfile_inputs" not in json.loads(out) and "installed by" not in err
+
+
+@pytest.mark.parametrize("flags", [(), ("--markdown",), ("--json",), ("--github-annotations",)])
+def test_plain_dockerfile_run_has_no_install_provenance(capsys, fake_pypi, dockerfile_provenance_inputs, flags):
+    plain = run(capsys, "requirements.txt", "-p", "3.13", "-t", "linux-x86_64", *flags)
+    assert run(capsys, "requirements.txt", "--dockerfile", "Dockerfile", *flags) == plain
 
 
 def test_github_annotations_advisory_targets_are_warnings(capsys, fake_pypi, fixtures, monkeypatch):
@@ -3440,18 +4179,148 @@ def test_github_annotations_requirements_other_line_breaks(capsys, fake_pypi, tm
 def test_github_annotations_requirements_lines(capsys, fake_pypi, tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
     req = tmp_path / "requirements.txt"
-    # Options, editables, paths and URLs aren't requirements with a line; an include cycle is read once.
+    # Options, editables, paths and URLs aren't requirements with a line.
     req.write_text(
         "--index-url https://pypi.org/simple\n-e ./editable\n./local\n"
         "git+https://example.invalid/x.git#egg=gitpkg\nnamed @ https://example.invalid/named-1.0.tar.gz\n"
         "-r other.txt\nnowheels==0.9\n",
         encoding="utf-8",
     )
-    (tmp_path / "other.txt").write_text("-r requirements.txt\npurewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "other.txt").write_text("purewheel==3.1\n", encoding="utf-8")
     assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,line=7,"]
     # A continued requirement is on the first line with something on it.
     req.write_text("purewheel==3.1\n\\\n\\\nnowheels==0.9\n", encoding="utf-8")
     assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,line=4,"]
+
+
+def test_github_annotations_requirement_with_options_keeps_its_line(capsys, fake_pypi, tmp_path, monkeypatch):
+    # The requirement ends where the parser ends it, before its options, so the line still matches.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "requirements.txt"
+    for line in ("nowheels==0.9 -f https://example.invalid/w.html", "nowheels==0.9 --no-binary nowheels"):
+        req.write_text(f"purewheel==3.1\n{line}\n", encoding="utf-8")
+        assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,line=2,"]
+
+
+def test_github_annotations_requirements_include_after_options(capsys, fake_pypi, tmp_path, monkeypatch):
+    # The scan follows a -r where the parser does (after other options, or a quoted path), so lines still match.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "requirements.txt"
+    (tmp_path / "dir with space").mkdir()
+    (tmp_path / "dir with space" / "other.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    for line in ('--pre -r "dir with space/other.txt"', '-r "dir with space/other.txt" -r gone.txt'):
+        req.write_text(f"{line}\nnowheels==0.9\n", encoding="utf-8")
+        assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,line=2,"]
+
+
+@pytest.mark.parametrize("include", ["-c cons.txt", '--pre --constraint="cons.txt"'])
+def test_github_annotations_requirements_inside_constraints(tmp_path, include):
+    from wheelgap.github import Locator
+    from wheelgap.sources import load_file
+
+    # Both the top-level and nested requirement keep their locations (#614).
+    req = tmp_path / "a.txt"
+    req.write_text(f"requests==2.32.5\n{include}\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("-r extra.txt\n", encoding="utf-8")
+    extra = tmp_path / "extra.txt"
+    extra.write_text("nowheels==0.9\n", encoding="utf-8")
+    source = load_file(req)
+    locator = Locator([source])
+    assert [(p.name, locator.locate(p)) for p in source.packages] == [
+        ("requests", (req, 1)),
+        ("nowheels", (extra, 1)),
+    ]
+
+
+def test_github_annotations_requirements_nested_constraints(capsys, fake_pypi, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "a.txt"
+    req.write_text("ranged==1.9\n-c sub/cons.txt\n", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "cons.txt").write_text("purewheel==3.1\n-r extra.txt\n", encoding="utf-8")
+    (sub / "extra.txt").write_text("-c deep.txt\nnowheels==0.9\n", encoding="utf-8")
+    (sub / "deep.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    # -c -> -r -> -c: only requirement lines get annotations, never the constraints themselves.
+    assert annotate(capsys, tmp_path, str(req)) == [
+        "::error file=sub/extra.txt,line=2,",
+        "::error file=a.txt,line=1,",
+    ]
+
+
+@pytest.mark.parametrize("includes", ["-c shared.txt\n-r shared.txt\n", "-r shared.txt\n-c shared.txt\n"])
+def test_github_annotations_requirements_both_roles(capsys, fake_pypi, tmp_path, monkeypatch, includes):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "a.txt"
+    req.write_text(includes + "-r extra.txt\n", encoding="utf-8")
+    (tmp_path / "shared.txt").write_text("-r extra.txt\nranged==1.9\n", encoding="utf-8")
+    (tmp_path / "extra.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    # Reading a file as constraints mustn't hide its own requirements when reached through -r.
+    # The requirement shared by all paths is still read only once.
+    assert annotate(capsys, tmp_path, str(req)) == [
+        "::error file=extra.txt,line=1,",
+        "::error file=shared.txt,line=2,",
+    ]
+
+
+def test_github_annotations_deps_inside_constraints(index, capsys, tmp_path, monkeypatch):  # noqa: F811
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "a.txt"
+    req.write_text("-c cons.txt\napp==1.0\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("-r extra.txt\n", encoding="utf-8")
+    (tmp_path / "extra.txt").write_text("crypt==1.0\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(req), "--deps", "-p", "3.14", "-t", "win-arm64", "--github-annotations")
+    assert code == 1
+    (line,) = [line for line in annotation_lines(out) if "title=crypt" in line]
+    assert line.startswith("::error file=extra.txt,line=1,")
+
+
+@pytest.mark.parametrize("target", ["https://example.invalid/cons.txt", "${CONSTRAINTS}"])
+def test_github_annotations_requirements_unread_constraints(capsys, fake_pypi, tmp_path, monkeypatch, target):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "a.txt"
+    req.write_text(f"-c {target}\nnowheels==0.9\n", encoding="utf-8")
+    # The parser leaves remote/environment-based constraints unread, so the scanner must too.
+    assert annotate(capsys, tmp_path, str(req)) == ["::error file=a.txt,line=2,"]
+
+
+@pytest.mark.parametrize("lines", [None, ["purewheel==3.1", "nowheels==0.9"]])
+def test_github_annotations_requirements_constraints_cross_check(capsys, fake_pypi, tmp_path, monkeypatch, lines):
+    from wheelgap import github
+
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "a.txt"
+    req.write_text("ranged==1.9\n-c cons.txt\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("-r extra.txt\n", encoding="utf-8")
+    (tmp_path / "extra.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    read = github._lines
+    monkeypatch.setattr(github, "_lines", lambda path: lines if path.name == "extra.txt" else read(path))
+    # If a nested file disappears or changes between parsing and locating, neither package gets a line.
+    assert annotate(capsys, tmp_path, str(req)) == ["::error file=a.txt,", "::error file=a.txt,"]
+
+
+def test_github_annotations_symlinked_requirements_inside_constraints(capsys, fake_pypi, tmp_path, monkeypatch):
+    # The requirements file is a link into real/, and both folders have a cons.txt and an extra.txt. pip reads
+    # the -c from the link's folder (#604) and the -r inside it as requirements (#614): nowheels is on
+    # link/extra.txt, not real/extra.txt, and the constraints file's own ranged line gives no annotation. The
+    # linked file's own line is on the file the link points to, which is the one git has lines for.
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").mkdir()
+    (tmp_path / "real" / "reqs.txt").write_text("-c cons.txt\nranged==1.9\n", encoding="utf-8")
+    (tmp_path / "real" / "cons.txt").write_text("-r extra.txt\n", encoding="utf-8")
+    (tmp_path / "real" / "extra.txt").write_text("psycopg2==2.9.11\n", encoding="utf-8")
+    (tmp_path / "link" / "cons.txt").write_text("ranged==1.9\n-r extra.txt\n", encoding="utf-8")
+    (tmp_path / "link" / "extra.txt").write_text("# read through link/cons.txt\nnowheels==0.9\n", encoding="utf-8")
+    try:
+        # A Path, so that Windows gets backslashes: a link written with forward slashes can't be opened there.
+        (tmp_path / "link" / "reqs.txt").symlink_to(Path("../real/reqs.txt"))
+    except OSError:
+        pytest.skip("symlinks aren't available here")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    assert annotate(capsys, tmp_path, str(tmp_path / "link" / "reqs.txt")) == [
+        "::error file=link/extra.txt,line=2,",
+        "::error file=real/reqs.txt,line=2,",
+    ]
 
 
 def test_github_annotations_requirements_cross_check(capsys, fake_pypi, tmp_path, monkeypatch):
@@ -3464,15 +4333,58 @@ def test_github_annotations_requirements_cross_check(capsys, fake_pypi, tmp_path
     req.write_text("nowheels==0.9\n", encoding="utf-8")
     scan = github.requirement_lines
 
-    def changed(path, seen=None):
+    def changed(path, seen=None, constraint_paths=()):
         req.write_text("purewheel==3.1\nnowheels==0.9\n", encoding="utf-8")
-        return scan(path, seen)
+        return scan(path, seen, constraint_paths)
 
     monkeypatch.setattr(github, "requirement_lines", changed)
     assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,"]
     # An include the scan can't read gives no lines at all.
     req.write_text("-r gone.txt\n", encoding="utf-8")
     assert scan(req) is None
+
+
+def test_github_annotations_keep_lines_when_included_file_is_reached_via_symlink_in_another_folder(
+    capsys, fake_pypi, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "shared.txt").write_text("-r more.txt\npurewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "more.txt").write_text("unpinned==4.2\n", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "more.txt").write_text("fastlib==2.0.0\n", encoding="utf-8")
+    try:
+        # A Path, so Windows gets ..\shared.txt: a / in a relative link target dangles there.
+        (sub / "link.txt").symlink_to(Path("../shared.txt"))
+    except OSError:
+        pytest.skip("symlinks unavailable on this platform/user")
+    req = tmp_path / "requirements.txt"
+    req.write_text("-r shared.txt\n-r sub/link.txt\nnowheels==0.9\n", encoding="utf-8")
+
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "musl-aarch64", "--github-annotations")
+    assert code == 1, err
+    lines = annotation_lines(out)
+    assert any(line.startswith("::error file=requirements.txt,line=3,title=nowheels 0.9") for line in lines)
+    assert any(line.startswith("::error file=sub/more.txt,line=1,title=fastlib 2.0.0") for line in lines)
+
+
+def test_github_annotations_keep_lines_for_repeated_include_and_handle_cycles(capsys, fake_pypi, tmp_path, monkeypatch):
+    from wheelgap import github
+
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "shared.txt").write_text("fastlib==2.0.0\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text("-r shared.txt\n-r shared.txt\nnowheels==0.9\n", encoding="utf-8")
+
+    _, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "musl-aarch64", "--github-annotations")
+    lines = annotation_lines(out)
+    assert any(line.startswith("::error file=requirements.txt,line=3,title=nowheels 0.9") for line in lines)
+    assert any(line.startswith("::error file=shared.txt,line=1,title=fastlib 2.0.0") for line in lines)
+
+    # An include cycle must return None rather than hang.
+    (tmp_path / "a.txt").write_text("-r b.txt\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("-r a.txt\n", encoding="utf-8")
+    assert github.requirement_lines(tmp_path / "a.txt") is None
 
 
 def test_github_annotations_messages(capsys, fake_pypi, fixtures, tmp_path, monkeypatch):
@@ -4311,6 +5223,169 @@ def test_default_uv_extra_is_attributed_only_to_the_direct_requester(capsys, tmp
     assert fake_pypi == []
 
 
+def test_whole_lock_hints_gap_reached_through_second_member_extra(capsys, tmp_path, fake_pypi):
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[manifest]\n"
+        'members = ["second"]\n'
+        "[[package]]\n"
+        'name = "app"\n'
+        'version = "1"\n'
+        'source = { editable = "." }\n'
+        "[[package]]\n"
+        'name = "second"\n'
+        'version = "1"\n'
+        'source = { editable = "packages/second" }\n'
+        "[package.optional-dependencies]\n"
+        'extra = [{ name = "cryptography" }]\n'
+        "[[package]]\n"
+        'name = "cryptography"\n'
+        'version = "50.0.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline")
+    assert code == 1 and not err
+    assert "cryptography (via second)" in out
+    assert fake_pypi == []
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline", "--explain")
+    assert code == 1 and "via: second → cryptography" in out
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--no-dev", "--offline")
+    assert code == 0 and "cryptography" not in out
+
+
+def test_whole_lock_hints_gap_reached_through_non_default_group(capsys, tmp_path, fake_pypi):
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[[package]]\n"
+        'name = "app"\n'
+        'version = "1"\n'
+        'source = { editable = "." }\n'
+        "[package.dev-dependencies]\n"
+        'lint = [{ name = "tool" }]\n'
+        "[[package]]\n"
+        'name = "tool"\n'
+        'version = "1"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'dependencies = [{ name = "cryptography" }]\n'
+        'wheels = [{ url = "https://files.example/tool-1-py3-none-any.whl" }]\n'
+        "[[package]]\n"
+        'name = "cryptography"\n'
+        'version = "50.0.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline")
+    assert code == 1 and not err
+    assert "cryptography (via tool)" in out
+    assert fake_pypi == []
+
+
+def test_whole_lock_hints_gap_in_second_member_group_name_the_group_dependency(capsys, tmp_path, fake_pypi):
+    # --explain starts a group's path at the group, not the member, so the hint names the group's dependency.
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[manifest]\n"
+        'members = ["second"]\n'
+        "[[package]]\n"
+        'name = "app"\n'
+        'version = "1"\n'
+        'source = { editable = "." }\n'
+        "[[package]]\n"
+        'name = "second"\n'
+        'version = "1"\n'
+        'source = { editable = "packages/second" }\n'
+        "[package.dev-dependencies]\n"
+        'lint = [{ name = "tool" }]\n'
+        "[[package]]\n"
+        'name = "tool"\n'
+        'version = "1"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'dependencies = [{ name = "cryptography" }]\n'
+        'wheels = [{ url = "https://files.example/tool-1-py3-none-any.whl" }]\n'
+        "[[package]]\n"
+        'name = "cryptography"\n'
+        'version = "50.0.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline")
+    assert code == 1 and not err
+    assert "cryptography (via tool)" in out and "via second" not in out
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline", "--explain")
+    assert code == 1 and "via: (lint group) → tool → cryptography" in out
+    assert fake_pypi == []
+
+
+def test_whole_lock_explain_path_goes_through_the_edge_that_asks_for_the_extra(capsys, tmp_path, fake_pypi):
+    # app needs alpha and beta; only beta asks for alpha[x], which pulls in cryptography. The path must go through beta.
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[[package]]\n"
+        'name = "app"\n'
+        'version = "1"\n'
+        'source = { editable = "." }\n'
+        'dependencies = [{ name = "alpha" }, { name = "beta" }]\n'
+        "[[package]]\n"
+        'name = "alpha"\n'
+        'version = "1"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'wheels = [{ url = "https://files.example/alpha-1-py3-none-any.whl" }]\n'
+        "[package.optional-dependencies]\n"
+        'x = [{ name = "cryptography" }]\n'
+        "[[package]]\n"
+        'name = "beta"\n'
+        'version = "1"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'dependencies = [{ name = "alpha", extra = ["x"] }]\n'
+        'wheels = [{ url = "https://files.example/beta-1-py3-none-any.whl" }]\n'
+        "[[package]]\n"
+        'name = "cryptography"\n'
+        'version = "50.0.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline", "--explain")
+    assert code == 1 and not err
+    assert "cryptography (via beta)" in out
+    assert "via: app → beta → alpha → cryptography" in out
+    assert fake_pypi == []
+
+
+def test_whole_lock_hints_in_virtual_workspace_name_the_direct_dependency(capsys, tmp_path, fake_pypi):
+    # With no project at the root, every member is where uv sync starts, so hints name the dependency, not the member.
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[manifest]\n"
+        'members = ["api"]\n'
+        "[[package]]\n"
+        'name = "api"\n'
+        'version = "1"\n'
+        'source = { editable = "packages/api" }\n'
+        'dependencies = [{ name = "tool" }]\n'
+        "[[package]]\n"
+        'name = "tool"\n'
+        'version = "1"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'dependencies = [{ name = "cryptography" }]\n'
+        'wheels = [{ url = "https://files.example/tool-1-py3-none-any.whl" }]\n'
+        "[[package]]\n"
+        'name = "cryptography"\n'
+        'version = "50.0.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline")
+    assert code == 1 and not err
+    assert "cryptography (via tool)" in out and "via api" not in out
+    assert fake_pypi == []
+
+
 def test_poetry_extra_edge_credits_nobody(capsys, tmp_path, fake_pypi):
     # Poetry's graph doesn't record which parent asked for an extra, so a package behind one gets no (via ...) hint.
     (tmp_path / "poetry.lock").write_text(
@@ -4610,14 +5685,147 @@ def test_project_exclude_newer_limits_range_resolution(fake_pypi, capsys, tmp_pa
     assert json.loads(out)["packages"][0]["version"] == "1.0"
 
 
-@pytest.mark.parametrize("value", ['"1 week"', '"2025-02-30"', '"2025-01-01T00:00:00"', "123"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        '"1 month"',  # uv refuses months and years: they have no fixed length
+        '"P1Y"',
+        '"3 fortnights"',
+        '"3 dayz"',
+        '" 3 days"',
+        '"1 day and 2 hours"',
+        '"5000000 days"',  # further back than uv's earliest timestamp
+        '"2025-02-30"',
+        '"2025-01-01T00:00:00"',
+        "123",
+        "true",
+        '{ timestamp = "2025-01-01T00:00:00Z", span = "P3D" }',  # uv's table form, which wheelgap doesn't read
+    ],
+)
 def test_project_exclude_newer_rejects_invalid_cutoffs(fake_pypi, capsys, tmp_path, value):
     path = tmp_path / "pyproject.toml"
     path.write_text(f'[project]\ndependencies = ["nowheels"]\n[tool.uv]\nexclude-newer = {value}\n', encoding="utf-8")
     code, out, err = run(capsys, str(path), "-p", "3.13", "-t", "win-arm64")
     assert code == 2
-    assert "exclude-newer" in err
+    assert f"{path}: [tool.uv] exclude-newer must be a date, an RFC 3339 timestamp, false or a duration: " in err
     assert fake_pypi == []
+
+
+RELEASED = {  # 2.0 came out on 2025-02-01; the tests below run "now" a few days later
+    "1.0": [{"filename": "dated-1.0-py3-none-any.whl", "upload_time_iso_8601": "2024-01-01T00:00:00Z"}],
+    "2.0": [{"filename": "dated-2.0-py3-none-any.whl", "upload_time_iso_8601": "2025-02-01T00:00:00Z"}],
+}
+
+
+@pytest.fixture
+def now_is(monkeypatch):
+    """Set the time uv's relative exclude-newer durations count back from."""
+    from datetime import datetime
+
+    from wheelgap import cutoff
+
+    def set_now(text):
+        monkeypatch.setattr(cutoff, "current_time", lambda: datetime.fromisoformat(text))
+
+    return set_now
+
+
+@pytest.mark.parametrize("script", [False, True])
+@pytest.mark.parametrize(
+    "duration, version, cutoff",
+    [
+        ("3 days", "1.0", "2025-01-31T00:00:00Z"),
+        ("P3D", "1.0", "2025-01-31T00:00:00Z"),
+        ("1 week", "1.0", "2025-01-27T00:00:00Z"),
+        ("1 day", "2.0", "2025-02-02T00:00:00Z"),
+        ("24 hours", "2.0", "2025-02-02T00:00:00Z"),
+        ("PT36H", "2.0", "2025-02-01T12:00:00Z"),
+        ("2 days", "1.0", "2025-02-01T00:00:00Z"),  # a file uploaded at the cutoff itself is left out, as by uv
+        ("47h 59m 59.999s", "2.0", "2025-02-01T00:00:00.001000Z"),
+        ("-3 days", "1.0", "2025-01-31T00:00:00Z"),  # uv takes the duration's absolute value
+        ("3 days ago", "1.0", "2025-01-31T00:00:00Z"),
+        ("0 days", "2.0", "2025-02-03T00:00:00Z"),
+    ],
+)
+def test_project_exclude_newer_duration_counts_back_from_now(
+    fake_pypi, capsys, tmp_path, monkeypatch, now_is, script, duration, version, cutoff
+):
+    from conftest import FAKE_INDEX
+
+    monkeypatch.setitem(FAKE_INDEX, "dated", RELEASED)
+    monkeypatch.delenv("UV_EXCLUDE_NEWER", raising=False)
+    now_is("2025-02-03T00:00:00+00:00")
+    if script:
+        path = tmp_path / "example.py"
+        text = f'# /// script\n# dependencies = ["dated>=1"]\n# [tool.uv]\n# exclude-newer = "{duration}"\n# ///\n'
+    else:
+        path = tmp_path / "pyproject.toml"
+        text = f'[project]\ndependencies = ["dated>=1"]\n[tool.uv]\nexclude-newer = "{duration}"\n'
+    path.write_text(text, encoding="utf-8")
+    code, out, err = run(capsys, str(path), "-p", "3.13", "-t", "win-arm64", "--json")
+    assert code == 0
+    assert json.loads(out)["packages"][0]["version"] == version
+    assert (
+        f"wheelgap: note: {path.name}: a duration counts back from the time of this run, as uv counts it back from "
+        f'the time it resolves: exclude-newer = "{duration}" is {cutoff}\n'
+    ) in err
+    # -q drops the note, not the cutoff.
+    code, out, err = run(capsys, str(path), "-p", "3.13", "-t", "win-arm64", "--json", "-q")
+    assert json.loads(out)["packages"][0]["version"] == version and "a duration counts back" not in err
+
+
+def test_project_exclude_newer_duration_moves_with_the_clock(fake_pypi, capsys, tmp_path, monkeypatch, now_is):
+    from conftest import FAKE_INDEX
+
+    monkeypatch.setitem(FAKE_INDEX, "dated", RELEASED)
+    path = tmp_path / "pyproject.toml"
+    path.write_text('[project]\ndependencies = ["dated"]\n[tool.uv]\nexclude-newer = "1 week"\n', encoding="utf-8")
+    versions = []
+    for now in ("2025-02-07T23:59:59+00:00", "2025-02-08T00:00:00+00:00", "2025-02-08T00:00:00.001+00:00"):
+        now_is(now)
+        code, out, _ = run(capsys, str(path), "-p", "3.13", "-t", "win-arm64", "--json")
+        versions.append(json.loads(out)["packages"][0]["version"])
+    assert versions == ["1.0", "1.0", "2.0"]  # 2.0 is a week old one millisecond after 2025-02-08T00:00:00Z
+
+
+@pytest.mark.parametrize(
+    "settings, version, notes",
+    [
+        ('exclude-newer = "1 week"\nexclude-newer-package = { Dated = "1 day" }', "2.0", 2),
+        ('exclude-newer = "1 day"\nexclude-newer-package = { dated = "P1W" }', "1.0", 2),
+        ('exclude-newer = "2025-03-01"\nexclude-newer-package = { dated = "1 week" }', "1.0", 1),
+        ('exclude-newer = "1 week"\nexclude-newer-package = { dated = false }', "2.0", 1),
+        ('exclude-newer = "1 week"\nexclude-newer-package = { other = "1 day" }', "1.0", 2),
+        ("exclude-newer = false", "2.0", 0),  # uv: no cutoff, whatever the user's own settings say
+        ('exclude-newer = false\nexclude-newer-package = { dated = "30 days" }', "1.0", 1),
+    ],
+)
+def test_project_exclude_newer_durations_per_package(
+    fake_pypi, capsys, tmp_path, monkeypatch, now_is, settings, version, notes
+):
+    from conftest import FAKE_INDEX
+
+    monkeypatch.setitem(FAKE_INDEX, "dated", RELEASED)
+    monkeypatch.delenv("UV_EXCLUDE_NEWER", raising=False)
+    now_is("2025-02-03T00:00:00+00:00")
+    path = tmp_path / "pyproject.toml"
+    path.write_text(f'[project]\ndependencies = ["dated"]\n[tool.uv]\n{settings}\n', encoding="utf-8")
+    code, out, err = run(capsys, str(path), "-p", "3.13", "-t", "win-arm64", "--json")
+    assert code == 0 and json.loads(out)["packages"][0]["version"] == version
+    assert err.count("a duration counts back") == bool(notes) and err.count('" is 2025-') == notes
+
+
+def test_exclude_newer_duration_in_a_uv_toml_beside_it(fake_pypi, capsys, tmp_path, monkeypatch, now_is):
+    from conftest import FAKE_INDEX
+
+    monkeypatch.setitem(FAKE_INDEX, "dated", RELEASED)
+    now_is("2025-02-03T00:00:00+00:00")
+    (tmp_path / "uv.toml").write_text('exclude-newer = "3 days"\n', encoding="utf-8")
+    path = tmp_path / "pyproject.toml"
+    path.write_text('[project]\ndependencies = ["dated"]\n[tool.uv]\nexclude-newer = "1 day"\n', encoding="utf-8")
+    code, out, err = run(capsys, str(path), "-p", "3.13", "-t", "win-arm64", "--json")
+    assert code == 0 and json.loads(out)["packages"][0]["version"] == "1.0"
+    assert 'exclude-newer = "3 days" is 2025-01-31T00:00:00Z' in err
 
 
 DATED = {
@@ -4685,7 +5893,8 @@ def test_project_exclude_newer_package_overrides_the_cutoff(
 @pytest.mark.parametrize(
     "settings",
     [
-        'exclude-newer-package = { dated = "7 days" }',
+        'exclude-newer-package = { dated = "7 months" }',
+        'exclude-newer-package = { dated = "7 dys" }',
         "exclude-newer-package = { dated = true }",
         'exclude-newer-package = "2025-01-01"',
         'exclude-newer-package = { dated = "2025-01-01", Dated = "2025-01-02" }',
@@ -4900,3 +6109,250 @@ def test_project_exclude_newer_applies_to_selected_extra(fake_pypi, capsys, tmp_
     code, out, err = run(capsys, str(path), "--extra", "test", "-p", "3.13", "-t", "win-arm64", "--json")
     assert code == 0
     assert [(p["name"], p["version"]) for p in json.loads(out)["packages"]] == [("dated", "1.0")]
+
+
+LOCKED_PYTHON_FILES = {
+    "poetry.lock": ("[[package]]", "python-versions", 'files = [{file = "purewheel-3.1-py3-none-any.whl"}]'),
+    # inherit_metadata: the lock records each package's marker, which the range needs (see the test below)
+    "pdm.lock": (
+        "[[package]]",
+        "requires_python",
+        'files = [{file = "purewheel-3.1-py3-none-any.whl"}]\n\n[metadata]\nstrategy = ["inherit_metadata"]',
+    ),
+    "pylock.toml": ("[[packages]]", "requires-python", 'wheels = [{name = "purewheel-3.1-py3-none-any.whl"}]'),
+}
+
+
+@pytest.mark.parametrize("lockfile", LOCKED_PYTHON_FILES)
+def test_offline_locked_package_python_range(capsys, tmp_path, fake_pypi, lockfile, monkeypatch):
+    from conftest import FAKE_INDEX
+
+    from wheelgap import check_lockfile, make_targets
+
+    table, key, files = LOCKED_PYTHON_FILES[lockfile]
+    path = tmp_path / lockfile
+    path.write_text(f'{table}\nname = "purewheel"\nversion = "3.1"\n{key} = "<3.13"\n{files}\n', encoding="utf-8")
+    args = (str(path), "--offline", "--explain", "-t", "linux-x86_64", "-p", "3.12,3.13")
+    code, out, _ = run(capsys, *args, "--json")
+    assert code == 1
+    packages = json.loads(out)["packages"]
+    assert [r["results"] for r in packages] == [
+        {"3.12 linux-x86_64": "wheel", "3.13 linux-x86_64": "n/a"},
+        {"3.12 linux-x86_64": "n/a", "3.13 linux-x86_64": "missing"},
+    ]
+    assert packages[1]["rejected"]["3.13 linux-x86_64"] == [
+        {"file": "purewheel-3.1-py3-none-any.whl", "reason": "requires Python <3.13"}
+    ]
+    assert "requires Python <3.13" in run(capsys, *args)[1]
+    targets = make_targets(["3.12", "3.13"], "linux-x86_64")
+    results = check_lockfile(path, targets, offline=True)
+    assert results[0].statuses[targets[0]] is Status.WHEEL
+    assert results[1].statuses[targets[1]] is Status.MISSING
+    assert fake_pypi == []
+    assert run(capsys, str(path), "--online", "--no-cache", "-t", "linux-x86_64", "-p", "3.13")[0] == 0
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "purewheel",
+        {"3.1": [{"filename": "purewheel-3.1-py3-none-any.whl", "requires_python": "<3.13"}]},
+    )
+    assert run(capsys, str(path), "--online", "--no-cache", "-t", "linux-x86_64", "-p", "3.13")[0] == 1
+
+
+@pytest.mark.parametrize("order", ["3.13,3.12", "3.12,3.13"])
+def test_offline_locked_python_range_without_a_version(capsys, tmp_path, fake_pypi, order):
+    """pylock.toml lets a package leave `version` out. Each Python still gets its own answer, whatever the -p order."""
+    path = tmp_path / "pylock.toml"
+    path.write_text(
+        '[[packages]]\nname = "purewheel"\nrequires-python = "<3.13"\n'
+        'wheels = [{name = "purewheel-3.1-py3-none-any.whl"}]\n',
+        encoding="utf-8",
+    )
+    code, out, _ = run(capsys, str(path), "--offline", "-t", "linux-x86_64", "-p", order, "--json")
+    assert code == 1
+    statuses = {
+        target: status
+        for package in json.loads(out)["packages"]
+        for target, status in package["results"].items()
+        if status != "n/a"
+    }
+    assert statuses == {"3.12 linux-x86_64": "wheel", "3.13 linux-x86_64": "missing"}
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    ("lockfile", "key", "metadata"),
+    [
+        # Before lock-version 2.1, a direct dependency's Python marker is only in pyproject.toml.
+        ("poetry.lock", "python-versions", '[metadata]\nlock-version = "2.0"\n'),
+        # Without inherit_metadata, a pdm.lock has no markers on its packages.
+        ("pdm.lock", "requires_python", ""),
+        ("pdm.lock", "requires_python", '[metadata]\nstrategy = ["cross_platform"]\n'),
+    ],
+)
+def test_locked_python_range_needs_markers_on_packages(capsys, tmp_path, fake_pypi, lockfile, key, metadata):
+    """Poetry and PDM install a package only on the Pythons its markers select. A lock that doesn't record them per
+    package can't say whether the range leaves out a Python the package is installed on, so it's read as before."""
+    path = tmp_path / lockfile
+    path.write_text(
+        f'[[package]]\nname = "purewheel"\nversion = "3.1"\n{key} = "<3.13"\n'
+        'files = [{file = "purewheel-3.1-py3-none-any.whl"}]\n\n' + metadata,
+        encoding="utf-8",
+    )
+    code, out, _ = run(capsys, str(path), "--offline", "-t", "linux-x86_64", "-p", "3.12,3.13", "--json")
+    assert code == 0
+    assert [p["results"] for p in json.loads(out)["packages"]] == [
+        {"3.12 linux-x86_64": "wheel", "3.13 linux-x86_64": "wheel"}
+    ]
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize("restriction", ["", 'python-versions = "*"', 'python-versions = "^3.12"'])
+def test_offline_locked_package_python_range_unrestricted(capsys, tmp_path, fake_pypi, restriction):
+    path = tmp_path / "poetry.lock"
+    path.write_text(
+        '[[package]]\nname = "purewheel"\nversion = "3.1"\n'
+        'files = [{file = "purewheel-3.1-py3-none-any.whl"}]\n' + restriction,
+        encoding="utf-8",
+    )
+    assert run(capsys, str(path), "--offline", "-t", "linux-x86_64", "-p", "3.13")[0] == 0
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize("lockname", ["uv.lock", "app.py.lock"])
+@pytest.mark.parametrize("requires_python", [">=3.10,<3.15", "==3.14.*", "~=3.14.0", ">=3.10,!=3.15.*"])
+def test_uv_lock_online_uses_python_lower_bound(capsys, tmp_path, fake_pypi, monkeypatch, lockname, requires_python):
+    from conftest import FAKE_INDEX
+
+    from wheelgap import check_lockfile, make_targets
+
+    filename = "purewheel-3.1-py3-none-any.whl"
+    monkeypatch.setitem(FAKE_INDEX, "purewheel", {"3.1": [{"filename": filename, "requires_python": requires_python}]})
+    lock = tmp_path / lockname
+    manifest = '[manifest]\nrequirements = [{ name = "purewheel" }]\n' if lockname.endswith(".py.lock") else ""
+    lock.write_text(
+        'version = 1\nrequires-python = ">=3.12"\n' + manifest + "\n[[package]]\n"
+        'name = "purewheel"\nversion = "3.1"\nsource = {registry = "https://pypi.org/simple"}\n'
+        f'wheels = [{{url = "https://files.pythonhosted.org/{filename}"}}]\n',
+        encoding="utf-8",
+    )
+    args = (str(lock), "--no-cache", "-p", "3.15", "-t", "linux-x86_64")
+    assert run(capsys, *args, "--offline")[0] == 0
+    code, out, err = run(capsys, *args, "--online", "--json", "--explain")
+    assert code == 0
+    _assert_matches_output_schema(json.loads(out))
+    package = json.loads(out)["packages"][0]
+    assert package["results"] == {"linux-x86_64": "wheel"}
+    assert package["pip_refuses"] == {filename: f"requires Python {requires_python}"}
+    assert "note: 1 package is checked as uv installs it, though pip would refuse it" in err
+    assert (
+        "purewheel 3.1 on linux-x86_64: checked as uv installs it (uv checks the Requires-Python lower bound); "
+        f"pip refuses it: requires Python {requires_python}"
+    ) in run(capsys, *args, "--online", "--explain")[1]
+    targets = make_targets("3.15", "linux-x86_64")
+    result = check_lockfile(lock, targets, online=True)[0]
+    assert result.statuses[targets[0]] is Status.WHEEL
+    assert result.to_dict()["pip_refuses"] == package["pip_refuses"]
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("purewheel==3.1\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(requirements), *args[1:], "--online", "--json")
+    assert code == 1
+    assert json.loads(out)["packages"][0]["results"] == {"linux-x86_64": "missing"}
+
+
+def test_uv_lock_online_python_upper_bound_is_per_python(capsys, tmp_path, fake_pypi, monkeypatch):
+    """With several Pythons, only the one pip refuses gets its files back, and only its entry has pip_refuses."""
+    from conftest import FAKE_INDEX
+
+    filename = "purewheel-3.1-py3-none-any.whl"
+    monkeypatch.setitem(FAKE_INDEX, "purewheel", {"3.1": [{"filename": filename, "requires_python": ">=3.10,<3.15"}]})
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        'version = 1\nrequires-python = ">=3.12"\n\n[[package]]\n'
+        'name = "purewheel"\nversion = "3.1"\nsource = {registry = "https://pypi.org/simple"}\n'
+        f'wheels = [{{url = "https://files.pythonhosted.org/{filename}"}}]\n',
+        encoding="utf-8",
+    )
+    args = (str(lock), "--no-cache", "--online", "--json", "-p", "3.14,3.15", "-t", "linux-x86_64")
+    code, out, err = run(capsys, *args)
+    assert code == 0
+    data = json.loads(out)
+    _assert_matches_output_schema(data)
+    assert [(p["results"], p.get("pip_refuses")) for p in data["packages"]] == [
+        ({"3.14 linux-x86_64": "wheel", "3.15 linux-x86_64": "n/a"}, None),
+        ({"3.14 linux-x86_64": "n/a", "3.15 linux-x86_64": "wheel"}, {filename: "requires Python >=3.10,<3.15"}),
+    ]
+    assert "note: 1 package is checked as uv installs it" in err
+    assert "pip would refuse" not in run(capsys, *args, "-q")[2]
+
+
+@pytest.mark.parametrize(
+    ("requires", "python", "ignores"),
+    [
+        (">=3.10,<3.15", "3.15", True),
+        ("<=3.14", "3.15", True),
+        ("<3.15", "3.14", False),
+        (">=3.10,<3.15", "3.9", False),
+        ("==3.14.*", "3.15", True),
+        ("==3.16.*", "3.15", False),
+        (">=3.16", "3.15", False),
+        ("==3.14.*,<3.15", "3.15", True),
+        ("~=3.14.0", "3.15", True),
+        ("~=3.16.0", "3.15", False),
+        ("~=3.13.0,<3.15", "3.15", True),
+        ("!=3.15.*", "3.15", True),
+        ("!=3.15.*,<3.15", "3.15", True),
+        (">=3.10,!=3.15.*", "3.15", True),
+        (">=3.15,!=3.15.*", "3.15", False),
+        (">=3.14,!=3.14.*,!=3.15.*", "3.15", False),
+        (">=3.14,!=3.14.*,<3.16", "3.15", False),
+        (">=3.15.99,!=3.15.99", "3.15", False),
+        (">=3.16,<3.12", "3.15", True),
+        ("==3.14,!=3.14", "3.15", True),
+        # Checked against uv 0.13.9 itself (uv pip install --dry-run on wheels with these Requires-Python).
+        ("==3.14.*", "3.13", False),
+        ("~=3.14.0", "3.13", False),
+        ("~=3.13.0", "3.15", True),
+        ("==3.14", "3.15", True),
+        ("===3.14", "3.15", True),
+        ("==3.15.0", "3.15", True),
+        # pip takes these, so there is nothing for uv to restore.
+        (">=3.10,!=3.15.*", "3.14", False),
+        ("!=3.15.*", "3.14", False),
+        ("invalid", "3.15", False),
+    ],
+)
+def test_uv_ignores_python_rejection_when_lower_bound_allows(requires, python, ignores):
+    from wheelgap.sources import uv_ignores_python_rejection
+
+    assert uv_ignores_python_rejection(requires, python) is ignores
+
+
+def test_requirements_file_conflicting_with_constraint_fails_without_lookup(capsys, tmp_path, fake_pypi):
+    req = tmp_path / "requirements.txt"
+    req.write_text("-c cons.txt\nidna==3.6\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("idna==3.7\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 1
+    assert "unknown" in out
+    expected = "could not check idna: requirement idna==3.6 conflicts with the constraint idna==3.7 (pip refuses this)"
+    assert expected in out
+    assert fake_pypi == []
+
+
+def test_pyproject_non_table_tool_exits_with_source_error(capsys, tmp_path, fake_pypi):
+    req = tmp_path / "requirements.txt"
+    req.write_text("idna==3.10\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("tool = 1\n", encoding="utf-8")
+
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and not out
+    assert "[tool] must be a table" in err
+    assert "AttributeError" not in err
+
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 2
+    payload = json.loads(out)["error"]
+    assert set(payload) == {"message", "type"}
+    assert "[tool] must be a table" in payload["message"]
+    assert payload["type"] == "SourceError"
+    assert fake_pypi == []

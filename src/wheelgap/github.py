@@ -13,14 +13,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import tomllib
 from bisect import bisect_right
+from collections.abc import Mapping
 from pathlib import Path
 
 from packaging.utils import canonicalize_name
 
+from . import fix, gapwheels
 from .check import Row, Status
-from .sources import _COMMENT_RE, _INCLUDE_RE, _NAMED_URL_RE, Package, Source, SourceError, requirement_to_package
+from .sources import _COMMENT_RE, _NAMED_URL_RE, Package, Source, SourceError, _line_include, requirement_to_package
 from .targets import Target
 
 # GitHub shows at most 10 error and 10 warning annotations per step; the rest are dropped.
@@ -172,56 +175,103 @@ _OTHER_BREAKS = re.compile("[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
 _NAME_START_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
-def requirement_lines(path: Path, seen: set[Path] | None = None) -> list[tuple[Package, Path, int | None]] | None:
-    """Each requirement of a requirements file and the files it includes with -r, as the parser reads them: the
-    package, the file and the line its name is on (None if that isn't clear). None if a file can't be read the
-    same way."""
-    seen = set() if seen is None else seen
-    path = path.resolve()
-    if path in seen:
-        return []
-    seen.add(path)
+def requirement_lines(
+    path: Path, seen: set[Path] | None = None, constraint_paths: tuple[Path, ...] = ()
+) -> list[tuple[Package, Path, int | None]] | None:
+    """Each requirement reached through -r/-c, as the parser reads it: the package, the file and the line its name
+    is on (None if that isn't clear). A constraints file's own lines aren't requirements. None if a file can't be
+    read the same way or an include cycle is hit. A file is read through the folder it was named in, as the parser
+    reads it; on a second visit of the same real file its own lines are skipped while its includes are followed
+    again from the new folder. `constraint_paths` are the -c files given beside the file (`pip install -r FILE
+    -c CONSTRAINTS`): the parser reads them first, each on an include chain of its own, and so does the scan."""
+    state: dict[bool, set[Path]] = {False: set() if seen is None else seen, True: set()}
+    out: list[tuple[Package, Path, int | None]] = []
+    for constraint_path in constraint_paths:
+        included = _requirement_lines(constraint_path, state, constraint=True)
+        if included is None:
+            return None
+        out.extend(included)
+    main_items = _requirement_lines(path, state)
+    if main_items is None:
+        return None
+    out.extend(main_items)
+    return out
+
+
+def _requirement_lines(
+    path: Path,
+    seen: dict[bool, set[Path]],
+    constraint: bool = False,
+    stack: list[Path] | None = None,
+) -> list[tuple[Package, Path, int | None]] | None:
+    """`seen` is the parser's: the resolved paths already read as requirements (False) and as constraints (True),
+    since a file can be read once in each role. `stack` tracks the active chain of named paths so include cycles
+    return None rather than recursing forever."""
+    path = Path(os.path.abspath(path))
+    if stack is None:
+        stack = []
+    if path in stack:
+        return None
+    resolved = path.resolve()
+    already_seen = resolved in seen[constraint]
+    seen[constraint].add(resolved)
     lines = _lines(path)
     if lines is None or any(_OTHER_BREAKS.search(line) for line in lines):
         return None
+    stack.append(path)
     out: list[tuple[Package, Path, int | None]] = []
-    number = 0
-    while number < len(lines):
-        group = [number]  # the physical lines of this logical line
-        raw = lines[number]
-        while raw.endswith("\\") and number + 1 < len(lines):  # the parser joins "\\\n" continuations
+    try:
+        number = 0
+        while number < len(lines):
+            group = [number]  # the physical lines of this logical line
+            raw = lines[number]
+            while raw.endswith("\\") and number + 1 < len(lines):  # the parser joins "\\\n" continuations
+                number += 1
+                group.append(number)
+                raw = raw[:-1] + " " + lines[number]
             number += 1
-            group.append(number)
-            raw = raw[:-1] + " " + lines[number]
-        number += 1
-        line = _COMMENT_RE.split(raw, 1)[0].strip()
-        if not line or line.startswith("#"):
-            continue
-        if m := _INCLUDE_RE.match(line):
-            included = requirement_lines(path.parent / m.group(1).strip(), seen)
-            if included is None:
-                return None
-            out.extend(included)
-            continue
-        if line.startswith(("-", ".", "/")):
-            continue  # options, constraints, editables and paths: never a package with a gap
-        tokens = line.split()
-        line = " ".join(
-            t for k, t in enumerate(tokens) if not t.startswith("--hash") and (k == 0 or tokens[k - 1] != "--hash")
-        )
-        if "://" in line and not _NAMED_URL_RE.match(line):
-            continue
-        try:
-            package = requirement_to_package(line, path.name)
-        except SourceError:
-            continue
-        if not package.skip:
-            # The first physical line with anything on it, if it starts with the package's name.
-            texts = [lines[i][:-1] if i != group[-1] else lines[i] for i in group]
-            first = next((i for i, text in zip(group, texts, strict=True) if text.strip()), None)
-            name = _NAME_START_RE.match(lines[first].strip()) if first is not None else None
-            found = first + 1 if first is not None and name and canonicalize_name(name.group()) == package.key else None
-            out.append((package, path, found))
+            line = _COMMENT_RE.split(raw, 1)[0].strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("-"):
+                try:  # the -r/-c the parser follows, wherever it sits on the line (`--pre -r base.txt`)
+                    include = _line_include(shlex.split(line), path.name)
+                except (ValueError, SourceError):
+                    return None  # the parser refused this file, so there's nothing to map
+                if include:
+                    is_constraint, target = include
+                    if is_constraint and ("://" in target or "${" in target):
+                        continue  # the parser leaves these constraints unread
+                    # -r means requirements even inside a constraints file; track each file in both roles.
+                    included = _requirement_lines(path.parent / target, seen, is_constraint, stack)
+                    if included is None:
+                        return None
+                    out.extend(included)
+                continue  # other options and editables: never a package with a gap
+            if constraint or already_seen or line.startswith(("-", ".", "/")):
+                continue  # options, constraints, already-read lines, editables and paths: skip
+            # The requirement ends before the first word that starts with "-", as the parser ends it (--hash, -f URL).
+            words = line.split(" ")
+            line = " ".join(
+                words[: next((k for k, word in enumerate(words) if word.startswith("-")), len(words))]
+            ).strip()
+            if "://" in line and not _NAMED_URL_RE.match(line):
+                continue
+            try:
+                package = requirement_to_package(line, path.name)
+            except SourceError:
+                continue
+            if not package.skip:
+                # The first physical line with anything on it, if it starts with the package's name.
+                texts = [lines[i][:-1] if i != group[-1] else lines[i] for i in group]
+                first = next((i for i, text in zip(group, texts, strict=True) if text.strip()), None)
+                name = _NAME_START_RE.match(lines[first].strip()) if first is not None else None
+                found = (
+                    first + 1 if first is not None and name and canonicalize_name(name.group()) == package.key else None
+                )
+                out.append((package, path, found))
+    finally:
+        stack.pop()
     return out
 
 
@@ -275,7 +325,7 @@ class Locator:
     @staticmethod
     def _read(source: Source, path: Path) -> dict:
         if source.kind == "requirements":
-            scanned = requirement_lines(path)
+            scanned = requirement_lines(path, constraint_paths=source.constraint_paths)
             if scanned is None:
                 return {}
             # The scan must find the same requirements as the parser, in the same order, or no line is trusted.
@@ -310,7 +360,7 @@ class Locator:
 def relative_path(path: Path, root_env: str = "GITHUB_WORKSPACE") -> str | None:
     """The path GitHub expects: relative to the repository (the `root_env` variable, GITHUB_WORKSPACE by default,
     else the current directory), with forward slashes. None for a file outside it, which GitHub couldn't show in the
-    diff."""
+    diff. Links are resolved: git keeps a link as a link, so only the file it points to has lines to show."""
     base = os.environ.get(root_env) or os.getcwd()
     try:
         return path.resolve().relative_to(Path(base).resolve()).as_posix()
@@ -325,8 +375,38 @@ GAP_WORDS = {
 }
 
 
+def upgrade_sentence(cells: list[fix.Cell], multi_py: bool) -> str:
+    """--fix: what a package's annotation says first when a newer official release has the wheel for some gaps."""
+    by_version: dict[str, list[str]] = {}
+    for c in cells:
+        by_version.setdefault(f"{c.row.package.name} {c.version}", []).append(c.target.label(multi_py))
+    has = "; ".join(f"{v} has the wheel for {', '.join(dict.fromkeys(labels))}" for v, labels in by_version.items())
+    return f" Upgrade: {has} (an official release); the --fix section of the log says how."
+
+
+def gap_wheel_sentence(fills: list[gapwheels.Fill], multi_py: bool, fallback: bool = False) -> str:
+    """--fix: what a package's annotation says when a gap wheel fills some of its gaps. `fills`: all of that
+    package's, which come from one input. The pip command for an input pip installs from as it is; a lockfile or a
+    script is pointed to the log's gap wheel section, as in gapwheels.explain_lines."""
+    on = ", ".join(dict.fromkeys(f.target.label(multi_py) for f in fills))
+    said = f" A gap wheel on wheelgap's gap wheel index fills {on} (unofficial, built by wheelgap from the PyPI sdist)"
+    said = f" If you can't upgrade:{said[:2].lower()}{said[2:]}" if fallback else said
+    if command := gapwheels.pip_install(fills[0]):
+        return f"{said}. Install it with: {command}"
+    return f"{said}; see the gap wheel section of the log for how to use it."
+
+
 def annotation(
-    row: Row, targets: list[Target], level: str, locator: Locator, advisory: frozenset[Target] = frozenset()
+    row: Row,
+    targets: list[Target],
+    level: str,
+    locator: Locator,
+    advisory: frozenset[Target] = frozenset(),
+    fills: list[gapwheels.Fill] | None = None,
+    *,
+    installed_by: str | None = None,
+    installed_through: Mapping[Path, str] | None = None,
+    upgrades: list[fix.Cell] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     by_status: dict[Status, list[str]] = {}
@@ -350,18 +430,6 @@ def annotation(
             for n in row.direct_via.get(t, ()):
                 direct.setdefault(canonicalize_name(n), n)
     names = list(direct.values())
-    message = f"{name} {'; '.join(parts)}"
-    if names:
-        message += f" (via {', '.join(names)}{'' if not any(rooted) else ' on some targets'})"
-    message += "."
-    if pkg.error:
-        message += f" Lookup error: {pkg.error}."
-    if level == "warning":
-        required = [s for t, s in row.results.items() if t not in row.ignored and t not in advisory]
-        if Status.SOURCE in required:
-            message += " Source builds are allowed (fail-on missing), so this doesn't fail the run."
-        else:
-            message += " Gaps on advisory targets don't fail the run."
     location = locator.locate(pkg)
     if deps_resolved and location is not None and not (gap_targets and all(rooted)):
         # Not the file's own requirement on every gap target, so its own line (if it has one, say with a marker
@@ -371,12 +439,35 @@ def annotation(
         transitive = not any(rooted) and all(row.direct_via.get(t) for t in gap_targets)
         via = locator.locate_via(pkg, names[0]) if transitive and len(names) == 1 else None
         location = via if via is not None else (location[0], None)
+    message = f"{name} {'; '.join(parts)}"
+    if names:
+        message += f" (via {', '.join(names)}{'' if not any(rooted) else ' on some targets'})"
+    if installed_by is not None:
+        # installed_through: each file the RUN line reads through an include (resolved), and the file on the line
+        # that leads to it. The file on the line itself isn't there, so its own packages say no more.
+        top = installed_through.get(location[0].resolve()) if installed_through and location is not None else None
+        through = f", through {top}" if top is not None else ""
+        message += f" (installed by {installed_by}{through})"
+    message += "."
+    if pkg.error:
+        message += f" Lookup error: {pkg.error}."
+    if level == "warning":
+        required = [s for t, s in row.results.items() if t not in row.ignored and t not in advisory]
+        if Status.SOURCE in required:
+            message += " Source builds are allowed (fail-on missing), so this doesn't fail the run."
+        else:
+            message += " Gaps on advisory targets don't fail the run."
     file = line = None
     if location is not None:
         file = relative_path(location[0])
         line = location[1] if file is not None else None
         if file is None:
             message += f" (in {location[0]})"
+    if upgrades:  # --fix: the official release first, as in the log's --fix section
+        message += upgrade_sentence(upgrades, multi_py)
+    if fills:  # --fix: a gap wheel never changes the level, the title or the line
+        # Last, after "(in FILE)", so the pip command ends the annotation and copies cleanly (#609).
+        message += gap_wheel_sentence(fills, multi_py, fallback=bool(upgrades))
     return workflow_command(level, message, file, line, f"{name}: {GAP_WORDS[worst][0]}")
 
 
@@ -386,17 +477,43 @@ def github_annotations(
     sources: list[Source],
     failing: list[Row],
     advisory: frozenset[Target] = frozenset(),
+    fills: list[gapwheels.Fill] | None = None,
+    *,
+    installed_by: Mapping[int, str] | None = None,
+    installed_through: Mapping[int, Mapping[Path, str]] | None = None,
+    fix_cells: list[fix.Cell] | None = None,
 ) -> list[str]:
     """One ::error per failing package and one ::warning per package whose gaps don't fail the run (source builds
     that --fail-on missing allows, or gaps only on --advisory targets), at most ANNOTATION_LIMIT of each: past that,
-    the last one says how many more there are."""
+    the last one says how many more there are. `fills`: --fix's, so a package a gap wheel fills says so (None or
+    empty: every annotation is as without --fix)."""
+    filled: dict[int, list[gapwheels.Fill]] = {}
+    for f in fills or []:
+        filled.setdefault(id(f.row), []).append(f)
+    upgraded: dict[int, list[fix.Cell]] = {}
+    for c in fix_cells or []:
+        if c.kind == fix.UPGRADE:
+            upgraded.setdefault(id(c.row), []).append(c)
     failing_ids = {id(r) for r in failing}
     locator = Locator(sources)
     out = []
     for level in ("error", "warning"):
         chosen = [r for r in rows if not r.ok and (id(r) in failing_ids) == (level == "error")]
         shown = chosen if len(chosen) <= ANNOTATION_LIMIT else chosen[: ANNOTATION_LIMIT - 1]
-        out += [annotation(r, targets, level, locator, advisory) for r in shown]
+        out += [
+            annotation(
+                r,
+                targets,
+                level,
+                locator,
+                advisory,
+                filled.get(id(r)),
+                installed_by=installed_by.get(id(r.package)) if installed_by is not None else None,
+                installed_through=installed_through.get(id(r.package)) if installed_through is not None else None,
+                upgrades=upgraded.get(id(r)),
+            )
+            for r in shown
+        ]
         if more := len(chosen) - len(shown):
             what = f"{more} more packages with gaps"  # never 1: a single extra would fit in the limit
             out.append(workflow_command(level, f"{what}; the log lists them all.", title=f"wheelgap: {what}"))

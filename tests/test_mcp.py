@@ -375,7 +375,7 @@ def test_check_package_explain_includes_issues_url(fake_pypi):
 
 
 def test_check_package_explain_issues_url_null_for_other_index(fake_pypi, monkeypatch):
-    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://other.example.com/simple")
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://other.example.com/pypi")
     (_, reply) = run(
         init(),
         call(
@@ -585,14 +585,27 @@ def test_check_lockfile_dependencies_refuses_lockfiles_and_offline(tmp_path, fix
         call("check_lockfile", path=str(fixtures / "uvproj" / "uv.lock"), dependencies=True, python="3.13"),
     )
     assert lockfile["result"]["isError"] is True
-    assert "--deps" in lockfile["result"]["content"][0]["text"]
+    assert "the dependencies argument" in lockfile["result"]["content"][0]["text"]
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("purewheel==3.1\n", encoding="utf-8")
     (_, offline) = run(
         init(), call("check_lockfile", path=str(requirements), dependencies=True, offline=True, python="3.13")
     )
     assert offline["result"]["isError"] is True
-    assert "--deps" in offline["result"]["content"][0]["text"]
+    assert "call without dependencies: true" in offline["result"]["content"][0]["text"]
+
+
+def test_check_lockfile_notes_an_index_option_in_requirements(fake_pypi, tmp_path):
+    # #632: the CLI's note reaches the MCP client in notes, by the option's name and never its value.
+    path = tmp_path / "requirements.txt"
+    path.write_text("--extra-index-url https://user:secret@example.invalid/whl/cpu\npurewheel==3.1\n", encoding="utf-8")
+    (_, reply) = run(init(), call("check_lockfile", path=str(path), python="3.13", targets=["linux-x86_64"]))
+    data = reply["result"]["structuredContent"]
+    assert (
+        "requirements.txt sets --extra-index-url, which wheelgap doesn't read: its packages were checked on PyPI "
+        "only, so a package pip finds elsewhere may install differently"
+    ) in data["notes"]
+    assert "secret" not in json.dumps(reply)
 
 
 def test_check_lockfile_lists_skipped_packages(fake_pypi, fixtures):
@@ -624,7 +637,7 @@ def test_check_lockfile_pixi_environment(fake_pypi, fixtures, environment):
     ("environment", "message"),
     [
         ("docs", "no environment 'docs' (it has: default, test)"),
-        ("", "--environment needs a name"),
+        ("", "the environment argument needs a name"),
         (42, "'environment' must be a string"),
         (["test"], "'environment' must be a string"),
     ],
@@ -647,13 +660,356 @@ def test_check_lockfile_uses_project_config_and_arguments_win(fake_pypi, fixture
     assert explicit["result"]["structuredContent"]["targets"] == ["3.13 linux-x86_64"]
 
 
-def test_check_lockfile_offline_config_means_no_lookups(fake_pypi, tmp_path):
-    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+@pytest.mark.parametrize("dependencies", [False, True])
+def test_check_lockfile_offline_config_means_no_lookups(fake_pypi, tmp_path, dependencies):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("purewheel==3.1\n", encoding="utf-8")
     (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\noffline = true\n", encoding="utf-8")
-    (_, reply) = run(init(), call("check_lockfile", path=str(tmp_path / "requirements.txt"), python="3.13"))
+    (_, reply) = run(init(), call("check_lockfile", path=str(requirements), python="3.13", dependencies=dependencies))
     assert reply["result"]["isError"] is True
-    assert "offline" in reply["result"]["content"][0]["text"]
+    message = reply["result"]["content"][0]["text"]
+    assert "call again with offline: false" in message
+    if dependencies:
+        assert "call without dependencies: true" in message
+    assert not re.search(r"(^|\s)--[a-z]", message)
     assert not fake_pypi
+
+
+def test_check_lockfile_offline_false_overrides_config(fake_pypi, tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("purewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\noffline = true\n", encoding="utf-8")
+    (_, reply) = run(init(), call("check_lockfile", path=str(requirements), python="3.13", offline=False))
+    assert reply["result"]["structuredContent"]["packages"] == 1
+    assert fake_pypi
+
+
+def test_check_dockerfile_old_syntax_heredoc_error_names_the_line(fake_pypi, tmp_path):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "# syntax=docker/dockerfile:1.4\nFROM python:3.13-slim\nRUN cat > /etc/x << EOF\nhi\nEOF\n", encoding="utf-8"
+    )
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), path=str(tmp_path)))
+    assert reply["result"]["isError"] is True
+    message = reply["result"]["content"][0]["text"]
+    assert message.startswith(f"{dockerfile}:3: # syntax=docker/dockerfile:1.4 may read the heredocs in ")
+    assert "-p/-t" not in message  # the command line's advice is translated
+    assert not fake_pypi
+
+
+@pytest.mark.parametrize("inputs", [False, True])
+def test_check_dockerfile_offline_error_gives_project_setting(fake_pypi, tmp_path, inputs):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("purewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\noffline = true\n", encoding="utf-8")
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python:3.13-slim\nCOPY requirements.txt /app/\nRUN pip install -r /app/requirements.txt\n",
+        encoding="utf-8",
+    )
+    args = {"inputs": True} if inputs else {"path": str(requirements)}
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), **args))
+    assert reply["result"]["isError"] is True
+    message = reply["result"]["content"][0]["text"]
+    assert "set offline = false in [tool.wheelgap]" in message
+    assert not re.search(r"(^|\s)--[a-z]", message)
+    assert not fake_pypi
+
+
+def test_check_lockfile_conflicting_selection_names_arguments(fixtures):
+    (_, reply) = run(
+        init(),
+        call(
+            "check_lockfile",
+            path=str(fixtures / "uvproj" / "uv.lock"),
+            only_groups=["dev"],
+            extras=["test"],
+        ),
+    )
+    assert reply["result"]["isError"] is True
+    message = reply["result"]["content"][0]["text"]
+    assert "only_groups cannot be combined with extras or all_extras" in message
+    assert not re.search(r"(^|\s)--[a-z]", message)
+
+
+def test_check_lockfile_unknown_group_names_no_flag(fixtures):
+    lock = fixtures / "uvselect" / "uv.lock"
+    (_, reply) = run(init(), call("check_lockfile", path=str(lock), python="3.13", offline=True, groups=["nope"]))
+    assert reply["result"]["isError"] is True
+    message = reply["result"]["content"][0]["text"]
+    assert "unknown groups: nope" in message
+    assert not re.search(r"(^|\s)--[a-z]", message)
+
+
+def test_check_lockfile_empty_python_in_config_names_the_setting(fixtures, tmp_path):
+    """A python = "" in [tool.wheelgap] is the setting's fault: the run never sees -p, so say so."""
+    (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj" / "uv.lock").read_bytes())
+    (tmp_path / "pyproject.toml").write_text('[tool.wheelgap]\npython = ""\n', encoding="utf-8")
+    (_, reply) = run(init(), call("check_lockfile", path=str(tmp_path / "uv.lock")))
+    assert reply["result"]["isError"] is True
+    message = reply["result"]["content"][0]["text"]
+    assert "[tool.wheelgap] python is empty" in message
+    assert not re.search(r"-p\b|-t\b", message)
+
+
+@pytest.mark.parametrize("python", ["", " ", ","])
+def test_check_lockfile_empty_python_argument_names_the_argument(fixtures, python):
+    """An empty python argument is the argument's fault, not a missing -p: omit it for the default Python."""
+    (_, reply) = run(init(), call("check_lockfile", path=str(fixtures / "uvproj" / "uv.lock"), python=python))
+    assert reply["result"]["isError"] is True
+    message = reply["result"]["content"][0]["text"]
+    assert message == ("'python' is empty: omit it to use the default Python, or pass a version like \"3.13\"")
+
+
+def test_check_lockfile_offline_false_note_about_pip_names_no_flag(fake_pypi, tmp_path, monkeypatch):
+    """offline: false on a uv.lock is --online: its note about files pip would refuse points at --explain and --json."""
+    filename = "purewheel-3.1-py3-none-any.whl"
+    monkeypatch.setitem(FAKE_INDEX, "purewheel", {"3.1": [{"filename": filename, "requires_python": ">=3.10,<3.15"}]})
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        'version = 1\nrequires-python = ">=3.12"\n\n[[package]]\n'
+        'name = "purewheel"\nversion = "3.1"\nsource = {registry = "https://pypi.org/simple"}\n'
+        f'wheels = [{{url = "https://files.pythonhosted.org/{filename}"}}]\n',
+        encoding="utf-8",
+    )
+    arguments = {"path": str(lock), "python": "3.15", "targets": ["linux-x86_64"]}
+    (_, reply) = run(init(), call("check_lockfile", offline=False, **arguments))
+    data = reply["result"]["structuredContent"]
+    assert data["ok"] is True
+    (note,) = [note for note in data["notes"] if "pip would refuse" in note]
+    assert note.endswith("(a package with a gap lists the files in its pip_refuses)")
+    assert all(not re.search(r"(^|\s)--[a-z]", note) for note in data["notes"])
+    # Left out, the lock is checked as before: on its own files, with nothing to say about pip.
+    (_, reply) = run(init(), call("check_lockfile", **arguments))
+    assert not any("pip would refuse" in note for note in reply["result"]["structuredContent"]["notes"])
+
+
+@pytest.mark.parametrize(
+    ("message", "lockfile", "translated"),
+    [
+        # Each is a message of the command line, as cli.py, offline.py and dockerfile.py word it.
+        (
+            "offline = true in [tool.wheelgap]: --deps would look packages up on PyPI; drop --deps, or pass --online "
+            "for this run",
+            True,
+            "offline = true in [tool.wheelgap]: the dependencies argument would look packages up on PyPI; call "
+            "without dependencies: true, or call again with offline: false",
+        ),
+        (
+            "--offline: requirements.txt needs the index for 1 package (zstandard); use a lockfile that lists each "
+            "package's files, or drop --offline",
+            True,
+            "offline: true: requirements.txt needs the index for 1 package (zstandard); use a lockfile that lists "
+            "each package's files, or call without offline: true",
+        ),
+        (
+            "note: --online looks up PyPI packages only; kept the locked files of 2 packages from other indexes",
+            True,
+            "note: offline: false looks up PyPI packages only; kept the locked files of 2 packages from other indexes",
+        ),
+        (
+            "note: uv.lock was checked; pixi.lock is in the same folder too (pass it, or --environment, to check it "
+            "instead)",
+            True,
+            "note: uv.lock was checked; pixi.lock is in the same folder too (pass it, or the environment argument, "
+            "to check it instead)",
+        ),
+        # check_dockerfile and check_dist have no offline or dependencies argument to point at.
+        (
+            "offline = true in [tool.wheelgap]: --fix would read the gap wheel list from wheelgap.github.io; drop "
+            "--fix, or pass --online for this run",
+            False,
+            "offline = true in [tool.wheelgap]: the fix argument would read the gap wheel list from "
+            "wheelgap.github.io; call without fix: true, or set offline = false in [tool.wheelgap]",
+        ),
+        (
+            "note: pyproject.toml lists direct dependencies only; their own dependencies aren't checked (use a "
+            "lockfile for that, or add --deps for PyPI)",
+            False,
+            "note: pyproject.toml lists direct dependencies only; their own dependencies aren't checked (use a "
+            "lockfile for that, or use check_lockfile with dependencies: true for PyPI)",
+        ),
+        (
+            "offline = true in [tool.wheelgap]: --dist looks the last release up on PyPI; drop --dist, or set "
+            "offline = false in [tool.wheelgap] (or drop the key)",
+            False,
+            "offline = true in [tool.wheelgap]: check_dist looks the last release up on PyPI; set offline = false "
+            "in [tool.wheelgap] (or drop the key)",
+        ),
+        (
+            "note: Dockerfile: FROM uses --build-arg PYTHON_VERSION=3.13",
+            False,
+            "note: Dockerfile: FROM uses build_args PYTHON_VERSION=3.13",
+        ),
+        (
+            "Dockerfile:1: ARG TAG has no default and no --build-arg TAG=VALUE, pass -p/-t instead",
+            False,
+            "Dockerfile:1: ARG TAG has no default and no build_args TAG=VALUE, use check_lockfile with python and "
+            "targets instead",
+        ),
+        (
+            "python:3.9 is on a Debian release older than bullseye: pass -t and --glibc instead",
+            False,
+            "python:3.9 is on a Debian release older than bullseye: use check_lockfile with targets and glibc instead",
+        ),
+        (
+            "--extra, --all-extras, --group, --only-group and --no-dev don't apply to a script",
+            True,
+            "extras, all_extras, groups, only_groups and no_dev don't apply to a script",
+        ),
+        ("note: --ignore matches no package: foo", True, "note: ignore in [tool.wheelgap] matches no package: foo"),
+        # Not the command line's flags: a file's own options, a longer flag, and paths. They stay as they are.
+        ("requirements.txt:2: --extra-index-url and --no-deps aren't read", True, None),
+        ("Dockerfile:1: duplicate --platform flag", False, None),
+        # A flag the Dockerfile's own pip line has (pip has --group too) is the user's word; only wheelgap's is named.
+        (
+            "Dockerfile:4: pip install --group: --dockerfile-inputs only reads -r FILE, -c FILE, --no-cache-dir, "
+            "--upgrade (-U), --disable-pip-version-check, --root-user-action, --no-input, --quiet (-q) and, with "
+            "pinned requirements, --prefer-binary",
+            False,
+            "Dockerfile:4: pip install --group: the inputs argument only reads -r FILE, -c FILE, --no-cache-dir, "
+            "--upgrade (-U), --disable-pip-version-check, --root-user-action, --no-input, --quiet (-q) and, with "
+            "pinned requirements, --prefer-binary",
+        ),
+        (
+            "Dockerfile:4: uv pip install --group: --dockerfile-inputs only reads -r FILE",
+            False,
+            "Dockerfile:4: uv pip install --group: the inputs argument only reads -r FILE",
+        ),
+        (
+            "Dockerfile:4: uv pip install --offline: --dockerfile-inputs only reads --system, -r FILE, -c FILE, "
+            "--no-cache, --no-cache-dir, --upgrade (-U) and --quiet (-q) for uv",
+            False,
+            "Dockerfile:4: uv pip install --offline: the inputs argument only reads --system, -r FILE, -c FILE, "
+            "--no-cache, --no-cache-dir, --upgrade (-U) and --quiet (-q) for uv",
+        ),
+        # A command in backticks is one to run as written.
+        (
+            "no lockfile found in /srv/app (looked for uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, "
+            "requirements.txt, requirements.lock, pixi.lock). To check a dependency group in its pyproject.toml, run "
+            "`wheelgap /srv/app/pyproject.toml --group NAME` (groups: dev). Pass a file, or package names like "
+            "`wheelgap numpy psycopg2`.",
+            True,
+            None,
+        ),
+        (
+            "more than 2000 packages; check a lockfile instead",
+            False,
+            "more than 2000 packages; make a lockfile and call check_lockfile on it",
+        ),
+        ("/srv/--fix/uv.lock: no such file or directory", True, None),
+        ("C:\\srv\\--deps\\uv.lock: invalid TOML", True, None),
+        (
+            "[tool.wheelgap] index-url must not contain credentials: "
+            "pass the URL with --index-url from a CI secret instead",
+            True,
+            "[tool.wheelgap] index-url must not contain credentials: "
+            "an MCP tool can't take an index URL with credentials: set index-url in [tool.wheelgap] to one without "
+            "them, or run wheelgap --index-url from a shell",
+        ),
+        (
+            "WHEELGAP_INDEX_URL points at a simple index (pkgs.example.com); wheelgap needs the JSON API, "
+            "e.g. https://pypi.org/pypi. To use a simple index, pass --index-url instead.",
+            True,
+            "WHEELGAP_INDEX_URL points at a simple index (pkgs.example.com); wheelgap needs the JSON API, "
+            "e.g. https://pypi.org/pypi. To use a simple index, set index-url in [tool.wheelgap] (a URL without "
+            "credentials) for the tools that check a project's files.",
+        ),
+        (
+            "--index-url must use https (plain http is only allowed for localhost)",
+            True,
+            "index-url in [tool.wheelgap] must use https (plain http is only allowed for localhost)",
+        ),
+        (
+            "pyproject.toml [tool.uv] required-environments matches none of the native targets for Python 3.13, "
+            "so the default targets are checked; select targets with -t",
+            True,
+            "pyproject.toml [tool.uv] required-environments matches none of the native targets for Python 3.13, "
+            "so the default targets are checked; pass targets explicitly",
+        ),
+        ("add it to -t as well", True, "include it in targets as well"),
+        # Short flags must not match inside longer flags, paths, or pip install commands.
+        ("unknown flag --no-try", True, None),
+        ("/srv/-t/uv.lock: no such file or directory", True, None),
+        ("Dockerfile:4: pip install -t /tmp/pkg six", False, None),
+        # Short flags in a quoted Dockerfile line are the shell's, not wheelgap's.
+        ("RUN <<\"EOF mkdir -p /app: Docker can't read the heredoc", False, None),
+        ("Dockerfile:4: pip install --no-deps -t /deps six", False, None),
+        ("Dockerfile:5: docker build -t app .", False, None),
+        # pip's own --index-url, quoted from a requirements file, is the file's option, not wheelgap's.
+        ("requirements.txt:1: pip ignores --index-url after a requirement", True, None),
+        ("requirements.txt:1: pip refuses this line: --index-url option requires 1 argument", True, None),
+        (
+            "requirements.txt:1: pip refuses this line: ambiguous option: --index (--extra-index-url, --index-url?)",
+            True,
+            None,
+        ),
+        (
+            "note: --suggest looks nothing up when packages come from another index (--index-url)",
+            True,
+            "note: --suggest looks nothing up when packages come from another index (index-url in [tool.wheelgap])",
+        ),
+        (
+            "--index-url is empty (is a CI variable unset?)",
+            True,
+            "index-url in [tool.wheelgap] is empty (is a CI variable unset?)",
+        ),
+        ("--index-url is not a valid URL", True, "index-url in [tool.wheelgap] is not a valid URL"),
+        ("--index-url must be an http(s) URL", True, "index-url in [tool.wheelgap] must be an http(s) URL"),
+        # Advice that names a Python version: check_dockerfile has no python argument, check_package has one.
+        (
+            "`python3.12 -m pip install -r requirements.txt` installs for Python 3.12, and this run checks 3.13: "
+            "run pip with the image's own Python, or check with -p 3.12",
+            False,
+            "`python3.12 -m pip install -r requirements.txt` installs for Python 3.12, and this run checks 3.13: "
+            "run pip with the image's own Python, or call check_lockfile on the requirements files with python "
+            "'3.12', the image's platform as targets, and its glibc (or musl) version as glibc (or musl)",
+        ),
+        (
+            "pyodide-lock.json is for Python 3.12 (Pyodide 0.27.0), but no pyodide target uses Python 3.12 "
+            "(pyodide targets: 3.13); try -p 3.12 -t pyodide",
+            False,
+            "pyodide-lock.json is for Python 3.12 (Pyodide 0.27.0), but no pyodide target uses Python 3.12 "
+            "(pyodide targets: 3.13); try python '3.12' with targets ['pyodide']",
+        ),
+        ("RUN cd /src && try -p 3.12 -t pyodide-build", False, None),
+        ("`wheelgap PATH or check with -p 3.12`", False, None),
+    ],
+)
+def test_cli_advice_is_translated_for_the_calling_tool(message, lockfile, translated):
+    assert mcp._translate_cli_message(message, lockfile=lockfile) == (translated or message)
+
+
+def test_check_lockfile_translates_index_url_credentials_and_short_target_flag(fake_pypi, tmp_path):
+    # 1. Credentials in [tool.wheelgap] index-url: error must not tell MCP client to pass --index-url.
+    cred_dir = tmp_path / "creds"
+    cred_dir.mkdir()
+    (cred_dir / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    (cred_dir / "pyproject.toml").write_text(
+        '[tool.wheelgap]\nindex-url = "https://user:secret@pkgs.example.com/simple"\n',
+        encoding="utf-8",
+    )
+    (_, cred_reply) = run(init(), call("check_lockfile", path=str(cred_dir / "requirements.txt"), python="3.13"))
+    assert cred_reply["result"]["isError"] is True
+    cred_text = cred_reply["result"]["content"][0]["text"]
+    assert "--index-url from a CI secret" not in cred_text
+    assert "set index-url in [tool.wheelgap] to one without them" in cred_text
+    assert "WHEELGAP_INDEX_URL" not in cred_text
+
+    # 2. Unmatched [tool.uv] required-environments: note must not tell MCP client to select targets with -t.
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    (env_dir / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\n\n'
+        "[tool.uv]\nrequired-environments = [\"sys_platform == 'freebsd'\"]\n",
+        encoding="utf-8",
+    )
+    (_, env_reply) = run(init(), call("check_lockfile", path=str(env_dir / "requirements.txt"), python="3.13"))
+    assert env_reply["result"]["isError"] is False
+    notes = env_reply["result"]["structuredContent"].get("notes", [])
+    assert any("pass targets explicitly" in note for note in notes)
+    assert all(" -t" not in note for note in notes)
 
 
 def test_check_lockfile_ignores_from_config(fake_pypi, tmp_path, fixtures):
@@ -855,7 +1211,7 @@ def test_check_dockerfile_reports_used_arg_defaults(
     assert all("-p/-t" not in note for note in data["notes"])
     for name, value in defaults.items():
         assert any(f"FROM uses the default of ARG {name}={value}" in note for note in data["notes"])
-    assert any("pass build_args if the build sets --build-arg" in note for note in data["notes"])
+    assert any("pass build_args if the build supplies a value" in note for note in data["notes"])
 
 
 def test_check_dockerfile_build_args_replace_the_defaults(fake_pypi, tmp_path, fixtures):
@@ -890,6 +1246,17 @@ def test_check_dockerfile_ignores_unused_arg_defaults(fake_pypi, tmp_path, fixtu
     (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile)))
     assert reply["result"]["structuredContent"]["image"]["build_args"] == {}
     assert not any("FROM uses the default of ARG" in note for note in reply["result"]["structuredContent"]["notes"])
+
+
+@pytest.mark.parametrize("inputs", [False, True])
+def test_check_dockerfile_scratch_image_names_no_flags(fake_pypi, tmp_path, fixtures, inputs):
+    """FROM scratch has no Python and no COPY wheelgap follows, but -p/-t are not the answer: point at the files."""
+    dockerfile = dockerfile_project(tmp_path, fixtures, "FROM scratch\n")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), inputs=inputs))
+    assert reply["result"]["isError"] is True
+    message = reply["result"]["content"][0]["text"]
+    assert "check_lockfile" in message
+    assert not re.search(r"-p\b|-t\b", message)
 
 
 def test_check_dockerfile_matches_the_cli(fake_pypi, tmp_path, fixtures, capsys):
@@ -938,6 +1305,363 @@ def test_check_dockerfile_directory_is_a_tool_error(fake_pypi, tmp_path, fixture
     (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(tmp_path)))
     assert reply["result"]["isError"] is True
     assert "is a directory" in reply["result"]["content"][0]["text"]
+
+
+INSTALLS_REQUIREMENTS = (
+    "FROM python:3.13-alpine\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\n"
+)
+
+
+def test_check_dockerfile_inputs_checks_what_the_image_installs(fake_pypi, tmp_path, fixtures):
+    # The uv.lock beside the Dockerfile isn't what the image installs: requirements.txt is.
+    dockerfile = dockerfile_project(tmp_path, fixtures, INSTALLS_REQUIREMENTS)
+    (tmp_path / "requirements.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), inputs=True))
+    data = reply["result"]["structuredContent"]
+    assert data["image"] == {
+        "python": "3.13",
+        "platform": "musl-x86_64",
+        "glibc": None,
+        "musl": "1.2",
+        "build_args": {},
+    }
+    assert data["targets"] == ["3.13 musl-x86_64"]
+    assert data["packages"] == 1 and data["skipped"] == []
+    assert {g["name"]: g["results"] for g in data["gaps"]} == {"nowheels": {"3.13 musl-x86_64": "source"}}
+    assert data["path"] == str(tmp_path.resolve())  # the build context
+    requirements = tmp_path / "requirements.txt"
+    assert f"{dockerfile}:4: RUN pip install -r reads {requirements}" in data["notes"]
+    # Without inputs (or with inputs: false) the lockfile in the folder is checked, as before.
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), inputs=False))
+    assert reply["result"]["structuredContent"]["packages"] == 5
+
+
+def test_check_dockerfile_inputs_returns_the_lines_it_read_and_the_ones_it_couldnt(fake_pypi, tmp_path):
+    # #708: a line wheelgap can't see into after the last install: the CLI says complete false, and so must the tool.
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python:3.13-slim\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\n"
+        "COPY setup.sh .\nRUN ./setup.sh\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "setup.sh").write_text("pip install psycopg2\n", encoding="utf-8")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), inputs=True))
+    data = reply["result"]["structuredContent"]
+    assert data["ok"] is True and data["passes"] is True  # the packages read have wheels, as the CLI's exit code says
+    assert data["summary"] == {"complete": False}
+    assert list(data)[list(data).index("passes") + 1] == "summary"  # read beside the verdict it qualifies
+    what = "this line runs `./setup.sh`, a script or program at a path"
+    [warning] = data["dockerfile_warnings"]
+    assert (warning["line"], warning["kind"]) == (6, "may-install") and warning["message"].startswith(what)
+    assert f"warning: {dockerfile}:6: {what}" in " ".join(data["notes"])
+    assert data["dockerfile_inputs"] == [
+        {"dockerfile": str(dockerfile), "line": 4, "file": "requirements.txt", "constraints": [], "includes": []}
+    ]
+    # Every line read: complete, and nothing to warn about.
+    dockerfile.write_text(INSTALLS_REQUIREMENTS, encoding="utf-8")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), inputs=True))
+    data = reply["result"]["structuredContent"]
+    assert data["summary"] == {"complete": True}
+    assert data["dockerfile_warnings"] == [] and not [note for note in data["notes"] if note.startswith("warning: ")]
+    assert [entry["file"] for entry in data["dockerfile_inputs"]] == ["requirements.txt"]
+
+
+def test_check_dockerfile_without_inputs_adds_no_inputs_keys(fake_pypi, tmp_path, fixtures):
+    dockerfile = dockerfile_project(tmp_path, fixtures, INSTALLS_REQUIREMENTS)
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile)))
+    data = reply["result"]["structuredContent"]
+    assert not {"summary", "dockerfile_inputs", "dockerfile_warnings"} & set(data)
+
+
+def test_check_dockerfile_inputs_reads_the_build_context(fake_pypi, tmp_path):
+    # docker build -f docker/Dockerfile . : COPY sources come from the context, not the Dockerfile's folder.
+    (tmp_path / "docker").mkdir()
+    dockerfile = tmp_path / "docker" / "Dockerfile"
+    dockerfile.write_text(INSTALLS_REQUIREMENTS, encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), inputs=True))
+    assert reply["result"]["isError"] is True  # no requirements.txt in docker/
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), inputs=True, context=str(tmp_path)))
+    data = reply["result"]["structuredContent"]
+    assert [g["name"] for g in data["gaps"]] == ["nowheels"]
+    assert data["path"] == str(tmp_path.resolve())
+
+
+def test_check_dockerfile_inputs_refused_line_is_a_tool_error_with_its_line(fake_pypi, tmp_path):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install --pre six\n", encoding="utf-8")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), inputs=True))
+    assert reply["result"]["isError"] is True
+    text = reply["result"]["content"][0]["text"]
+    # -r FILE and --no-cache-dir are pip's own options, in the Dockerfile's words: they stay.
+    assert f"{dockerfile}:4: pip install --pre: the inputs argument only reads -r FILE" in text
+    assert "--dockerfile-inputs" not in text  # the CLI's flag isn't an argument here
+    assert not fake_pypi
+
+
+def test_check_dockerfile_inputs_other_python_names_no_python_flag(fake_pypi, tmp_path):
+    # check_dockerfile checks the image's Python and has no python argument, so -p is no way out (#669).
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\nRUN python3.12 -m pip install -r requirements.txt\n",
+        encoding="utf-8",
+    )
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), inputs=True))
+    assert reply["result"]["isError"] is True
+    text = reply["result"]["content"][0]["text"]
+    assert "installs for Python 3.12, and this run checks 3.13" in text
+    assert "check_lockfile on the requirements files with python '3.12'" in text
+    assert "-p 3.12" not in text
+    assert not fake_pypi
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"inputs": True, "path": "uv.lock"}, "'inputs' takes the packages from the Dockerfile"),
+        ({"inputs": "yes"}, "'inputs' must be true or false"),
+        ({"inputs": 1}, "'inputs' must be true or false"),
+        ({"context": "."}, "'context' is only used with 'inputs'"),
+        ({"inputs": False, "context": "."}, "'context' is only used with 'inputs'"),
+        ({"inputs": True, "context": " "}, "'context' is empty"),
+        ({"inputs": True, "context": "Dockerfile"}, "is not a folder"),
+        ({"inputs": True, "context": "/no/such/folder"}, "no such file or directory"),
+        ({"inputs": True, "context": 3}, "'context' must be a string"),
+        ({"fix": "yes"}, "'fix' must be true or false"),
+    ],
+)
+def test_check_dockerfile_inputs_argument_errors(
+    fake_pypi, gap_wheels, tmp_path, fixtures, monkeypatch, arguments, message
+):
+    monkeypatch.chdir(tmp_path)
+    dockerfile = dockerfile_project(tmp_path, fixtures, INSTALLS_REQUIREMENTS)
+    (tmp_path / "requirements.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), **arguments))
+    assert reply["result"]["isError"] is True
+    assert message in reply["result"]["content"][0]["text"]
+    assert not fake_pypi and gap_wheels.calls == 0
+
+
+FT_WHEEL = "nowheels-0.9-cp314-cp314t-win_arm64.whl"
+FT_WIN_ARM = {"python": "3.14t", "targets": ["win-arm64"]}
+
+
+def nowheels_requirements(tmp_path) -> str:
+    (tmp_path / "requirements.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    return str(tmp_path / "requirements.txt")
+
+
+def test_check_lockfile_fix_returns_the_gap_wheels(fake_pypi, gap_wheels, tmp_path):
+    from wheelgap import gapwheels
+
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    path = nowheels_requirements(tmp_path)
+    (_, plain) = run(init(), call("check_lockfile", path=path, **FT_WIN_ARM))
+    data = plain["result"]["structuredContent"]
+    assert not {"gap_wheels", "gap_wheel_index", "gap_wheel_about"} & set(data)
+    assert gap_wheels.calls == 0  # no request without fix
+    (_, reply) = run(init(), call("check_lockfile", path=path, fix=True, **FT_WIN_ARM))
+    fixed = reply["result"]["structuredContent"]
+    assert gap_wheels.calls == 1
+    assert fixed["gap_wheels"] == [
+        {
+            "name": "nowheels",
+            "version": "0.9",
+            "target": "3.14t win-arm64",  # the full label, as in results
+            "wheel": FT_WHEEL,
+            "url": f"{gapwheels.DOWNLOAD}/{FT_WHEEL}",
+            "sha256": "ab" * 32,
+        }
+    ]
+    assert fixed["gap_wheel_index"] == "https://wheelgap.github.io/wheels/simple/"
+    assert fixed["gap_wheel_about"] == "https://wheelgap.github.io/wheels/"
+    # Each gap's way out, labelled like results (after 0.13.0): nowheels has no newer release, so the gap wheel.
+    assert [g.pop("fix") for g in fixed["gaps"]] == [
+        {
+            "3.14t win-arm64": {
+                "kind": "gap_wheel",
+                "wheel": FT_WHEEL,
+                "url": f"{gapwheels.DOWNLOAD}/{FT_WHEEL}",
+                "sha256": "ab" * 32,
+                "unofficial": True,
+            }
+        }
+    ]
+    assert fixed["fix_summary"] == {
+        "gaps": 1,
+        "upgrade": 0,
+        "gap_wheel": 1,
+        "none": 0,
+        "not_looked_up": 0,
+        "uv_may_fork": 0,
+    }
+    # It never changes the answer: the gap is still PyPI's.
+    assert fixed["gaps"] == data["gaps"] and fixed["ok"] is False and fixed["passes"] is False
+
+
+def test_check_lockfile_fix_with_offline_is_a_tool_error_with_no_lookups(fake_pypi, gap_wheels, tmp_path):
+    path = nowheels_requirements(tmp_path)
+    (_, reply) = run(init(), call("check_lockfile", path=path, fix=True, offline=True, **FT_WIN_ARM))
+    assert reply["result"]["isError"] is True
+    assert "'fix'" in reply["result"]["content"][0]["text"] and "'offline'" in reply["result"]["content"][0]["text"]
+    assert not fake_pypi and gap_wheels.calls == 0
+
+
+def test_check_lockfile_fix_says_when_no_gap_wheel_fits(fake_pypi, gap_wheels, tmp_path):
+    (_, reply) = run(init(), call("check_lockfile", path=nowheels_requirements(tmp_path), fix=True, **FT_WIN_ARM))
+    data = reply["result"]["structuredContent"]
+    assert data["gap_wheels"] == [] and gap_wheels.calls == 1
+    assert any(
+        note.startswith("the fix argument: no wheel on the gap wheel list fetched at ")
+        and note.endswith(" UTC fills these gaps")
+        for note in data["notes"]
+    )
+
+
+def test_check_lockfile_fix_refreshes_a_cached_list_that_fills_nothing(fake_pypi, gap_wheels, tmp_path, monkeypatch):
+    import urllib.error
+
+    from wheelgap import cache
+
+    now = 1_700_000_000.0  # 2023-11-14 22:13:20 UTC
+    monkeypatch.setattr(cache, "_now", lambda: now)
+    path = nowheels_requirements(tmp_path)
+
+    def check():
+        (_, reply) = run(init(), call("check_lockfile", path=path, fix=True, **FT_WIN_ARM))
+        return reply["result"]["structuredContent"]
+
+    # The list is cached with a wheel for another package: it fills nothing here.
+    gap_wheels.add("psycopg2", "2.9.11", "psycopg2-2.9.11-cp314-cp314t-win_arm64.whl")
+    assert check()["gap_wheels"] == [] and gap_wheels.calls == 1
+    # Past the 5-minute recheck window, a refresh that fails answers from the cached list with its time.
+    now += cache.GAP_WHEELS_RECHECK_AGE + 60
+    live, gap_wheels.doc = gap_wheels.doc, urllib.error.URLError("temporary failure")
+    data = check()
+    assert data["gap_wheels"] == [] and gap_wheels.calls == 2
+    stale = (
+        "the fix argument: no wheel on the gap wheel list fetched at 22:13 UTC fills these gaps; "
+        "the list couldn't be refreshed"
+    )
+    assert stale in data["notes"]
+    # The wheel is published: the cached list still lacks it, so the list is fetched again and the fill is found.
+    gap_wheels.doc = live
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    data = check()
+    assert [w["wheel"] for w in data["gap_wheels"]] == [FT_WHEEL] and gap_wheels.calls == 3
+    # Now the cached list fills the gap: no request.
+    assert [w["wheel"] for w in check()["gap_wheels"]] == [FT_WHEEL] and gap_wheels.calls == 3
+
+
+def test_check_lockfile_quiet_config_keeps_notes(fake_pypi, gap_wheels, tmp_path, monkeypatch):
+    # A project that sets quiet = true for its own terminal runs must not lose the MCP notes.
+    from wheelgap import cache
+
+    # The no-fill note names the minute the list was fetched: a clock that moves on could split the two runs.
+    monkeypatch.setattr(cache, "_now", lambda: 1_700_000_000.0)
+    path = nowheels_requirements(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\nquiet = true\n", encoding="utf-8")
+
+    def check(**arguments):
+        (_, reply) = run(init(), call("check_lockfile", path=path, **arguments))
+        return reply["result"]["structuredContent"]
+
+    # The --fix note, with the gap wheel list from the fixture: no wheel fills the gap.
+    quiet = check(fix=True, **FT_WIN_ARM)
+    assert quiet["gap_wheels"] == []
+    assert any(
+        note.startswith("the fix argument: no wheel on the gap wheel list fetched at ")
+        and note.endswith(" UTC fills these gaps")
+        for note in quiet["notes"]
+    )
+    (tmp_path / "pyproject.toml").unlink()
+    assert check(fix=True, **FT_WIN_ARM)["notes"] == quiet["notes"]
+
+    # The same, with a gap wheel from the fixture that fills the gap.
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\nquiet = true\n", encoding="utf-8")
+    quiet = check(fix=True, **FT_WIN_ARM)
+    assert [w["name"] for w in quiet["gap_wheels"]] == ["nowheels"]
+    (tmp_path / "pyproject.toml").unlink()
+    plain = check(fix=True, **FT_WIN_ARM)
+    assert plain["gap_wheels"] == quiet["gap_wheels"] and plain["notes"] == quiet["notes"]
+
+    # A note that needs no network: --fix is off with another index, so the list is never read.
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example.com/pypi")
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\nquiet = true\n", encoding="utf-8")
+    calls = gap_wheels.calls
+    quiet = check(fix=True, **FT_WIN_ARM)
+    assert quiet["gap_wheels"] == [] and gap_wheels.calls == calls
+    assert any(note.startswith("the fix argument is off with ") for note in quiet["notes"])
+    (tmp_path / "pyproject.toml").unlink()
+    assert check(fix=True, **FT_WIN_ARM)["notes"] == quiet["notes"]
+
+
+def test_check_dockerfile_quiet_config_keeps_notes(fake_pypi, gap_wheels, tmp_path, monkeypatch):
+    from wheelgap import cache
+
+    # The no-fill note names the minute the list was fetched: a clock that moves on could split the two runs.
+    monkeypatch.setattr(cache, "_now", lambda: 1_700_000_000.0)
+    (tmp_path / "Dockerfile").write_text("FROM python:3.13-alpine\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\nquiet = true\n", encoding="utf-8")
+    arguments = {"dockerfile": str(tmp_path / "Dockerfile"), "path": nowheels_requirements(tmp_path)}
+    (_, quiet_reply) = run(init(), call("check_dockerfile", fix=True, **arguments))
+    quiet = quiet_reply["result"]["structuredContent"]
+    assert quiet["gap_wheels"] == []
+    assert any(
+        note.startswith("the fix argument: no wheel on the gap wheel list fetched at ")
+        and note.endswith(" UTC fills these gaps")
+        for note in quiet["notes"]
+    )
+    (tmp_path / "pyproject.toml").unlink()
+    (_, reply) = run(init(), call("check_dockerfile", fix=True, **arguments))
+    assert reply["result"]["structuredContent"]["notes"] == quiet["notes"]
+
+
+def test_check_lockfile_fix_is_off_with_another_index(fake_pypi, gap_wheels, tmp_path, monkeypatch):
+    # A mirror may hold private names: the list isn't read, as on the command line, and a note says so.
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example.com/pypi")
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    (_, reply) = run(init(), call("check_lockfile", path=nowheels_requirements(tmp_path), fix=True, **FT_WIN_ARM))
+    data = reply["result"]["structuredContent"]
+    assert data["gap_wheels"] == [] and gap_wheels.calls == 0
+    assert any(note.startswith("the fix argument is off with ") for note in data["notes"])
+    assert all(not re.search(r"(^|\s)--[a-z]", note) for note in data["notes"])
+
+
+@pytest.mark.usefixtures("index")
+def test_check_lockfile_fix_with_dependencies_keeps_full_labels(gap_wheels, tmp_path):
+    # --deps runs under --explain, whose per-package gap_wheel key has the CLI's short labels: only gap_wheels is kept.
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("app==1.0\n", encoding="utf-8")
+    arguments = {"path": str(requirements), "python": "3.14", "targets": ["win-arm64"]}
+    (_, plain) = run(init(), call("check_lockfile", dependencies=True, **arguments))
+    (crypt,) = (g for g in plain["result"]["structuredContent"]["gaps"] if g["name"] == "crypt")
+    gap_wheels.add("crypt", crypt["version"], f"crypt-{crypt['version']}-cp314-cp314-win_arm64.whl")
+    (_, reply) = run(init(), call("check_lockfile", dependencies=True, fix=True, **arguments))
+    data = reply["result"]["structuredContent"]
+    assert [(w["name"], w["target"]) for w in data["gap_wheels"]] == [("crypt", "3.14 win-arm64")]
+    assert all("gap_wheel" not in gap for gap in data["gaps"])
+
+
+def test_check_dockerfile_fix_returns_the_gap_wheels(fake_pypi, gap_wheels, tmp_path):
+    gap_wheels.add("nowheels", "0.9", "nowheels-0.9-cp313-cp313-musllinux_1_2_x86_64.whl")
+    (tmp_path / "Dockerfile").write_text("FROM python:3.13-alpine\n", encoding="utf-8")
+    arguments = {"dockerfile": str(tmp_path / "Dockerfile"), "path": nowheels_requirements(tmp_path)}
+    (_, plain) = run(init(), call("check_dockerfile", **arguments))
+    assert "gap_wheels" not in plain["result"]["structuredContent"] and gap_wheels.calls == 0
+    (_, reply) = run(init(), call("check_dockerfile", fix=True, **arguments))
+    data = reply["result"]["structuredContent"]
+    assert [(w["name"], w["version"], w["target"]) for w in data["gap_wheels"]] == [
+        ("nowheels", "0.9", "3.13 musl-x86_64")
+    ]
+    assert data["gap_wheel_index"] and data["image"]["platform"] == "musl-x86_64"
+    # With inputs: the same gap, found from the Dockerfile's own RUN pip install -r.
+    (tmp_path / "Dockerfile").write_text(INSTALLS_REQUIREMENTS, encoding="utf-8")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=arguments["dockerfile"], inputs=True, fix=True))
+    assert reply["result"]["structuredContent"]["gap_wheels"] == data["gap_wheels"]
 
 
 def test_check_dist_names_each_dropped_target(fake_pypi, tmp_path):
@@ -2140,6 +2864,53 @@ def test_diff_lockfiles_looks_requirements_up(fake_pypi, tmp_path):
     assert fake_pypi
 
 
+def test_diff_lockfiles_rejects_simple_index_before_comparing_requirements(fake_pypi, tmp_path, monkeypatch):
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://x.test/simple")
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("ranged==1.5\n", encoding="utf-8")
+    (_, reply) = run(init(), call("diff_lockfiles", old=str(requirements), new=str(requirements)))
+    result = reply["result"]
+    assert result["isError"] is True
+    message = result["content"][0]["text"]
+    assert "WHEELGAP_INDEX_URL points at a simple index" in message and "JSON API" in message
+    assert "[tool.wheelgap]" not in message and "--index-url" not in message
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize("side", ["old", "new"])
+def test_diff_lockfiles_refuses_an_index_url_beside_either_lockfile(fake_pypi, tmp_path, capsys, side):
+    # #710: wheelgap diff refuses it since #705; the tool answered ok from PyPI for a project on a private index.
+    from wheelgap import diff
+
+    old, new = lockfile_pair(tmp_path, uv_package("ranged", "1.9", "sdist"), uv_package("ranged", "1.9", "sdist"))
+    url = "https://user:secret@private.example/simple"
+    (tmp_path / side / "pyproject.toml").write_text(f'[tool.wheelgap]\nindex-url = "{url}"\n', encoding="utf-8")
+    (_, reply) = run(init(), call("diff_lockfiles", old=old, new=new, python="3.13", targets=["linux-x86_64"]))
+    assert reply["result"]["isError"] is True
+    text = reply["result"]["content"][0]["text"]
+    lock = old if side == "old" else new
+    assert text == (
+        f"the pyproject.toml beside {lock} sets index-url in [tool.wheelgap], which diff_lockfiles doesn't read yet, "
+        "so it would check PyPI instead of that index; check each lockfile with check_lockfile instead, which uses it"
+    )
+    assert "private.example" not in text and "secret" not in text
+    assert not fake_pypi  # refused before any lookup
+    assert diff.main([old, new, "-p", "3.13", "-t", "linux-x86_64"]) == 2  # as wheelgap diff
+    assert "sets index-url in [tool.wheelgap], which wheelgap diff doesn't read yet" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("side", ["old", "new"])
+def test_diff_lockfiles_non_table_tool_is_a_tool_error(fake_pypi, tmp_path, side):
+    old, new = lockfile_pair(tmp_path, uv_package("purewheel", "3.1"), uv_package("purewheel", "3.1"))
+    (tmp_path / side / "pyproject.toml").write_text("tool = 1\n", encoding="utf-8")
+    (_, reply) = run(init(), call("diff_lockfiles", old=old, new=new, python="3.13", targets=["linux-x86_64"]))
+    assert reply["result"]["isError"] is True
+    text = reply["result"]["content"][0]["text"]
+    assert "[tool] must be a table" in text
+    assert "AttributeError" not in text
+    assert fake_pypi == []
+
+
 def test_diff_lockfiles_malformed_lockfile_is_a_tool_error(fake_pypi, tmp_path):
     old, new = lockfile_pair(tmp_path, uv_package("purewheel", "3.1"), uv_package("purewheel", "3.1"))
     Path(new).write_text("[[package\n", encoding="utf-8")
@@ -2261,6 +3032,17 @@ def test_explain_install_failure_notes_where_the_log_likely_comes_from(fake_pypi
     ]
 
 
+def test_explain_install_failure_pypy_log_gets_the_cpython_only_note(fake_pypi):
+    data = explain_failure(log=install_log("pip24-pypy.log"), python="3.13", targets=["linux-x86_64"])[
+        "structuredContent"
+    ]
+    assert {p["name"]: p["results"] for p in data["packages"]} == {"fastlib": {"3.13 linux-x86_64": "wheel"}}
+    assert data["notes"] == [
+        "the install log's build ran on PyPy, and wheelgap checks CPython wheels only: the answers are for "
+        "CPython and don't say why the build failed there (PyPy wheels carry pp tags, such as pp311, not cp ones)"
+    ]
+
+
 @pytest.mark.parametrize(
     ("arguments", "assumed"),
     [
@@ -2288,13 +3070,27 @@ def test_explain_install_failure_log_with_no_failure_is_an_error(fake_pypi):
 
 
 def test_explain_install_failure_refusal_gives_the_tools_advice(fake_pypi):
-    result = explain_failure(log=install_log("pip-no-version.log"), python="3.13", targets=["win-amd64"])
+    result = explain_failure(log=install_log("pip-unclear-version.log"), python="3.13", targets=["win-amd64"])
     assert result["isError"] is True
     text = result["content"][0]["text"]
-    assert text.startswith("the log doesn't say which version of nowheels failed to build")
-    assert "(call check_package for nowheels with the version)" in text
+    assert text.startswith("the log collects forked again without a version")
+    assert "(call check_package for forked with the version)" in text
     assert "--from-log" not in text and "==VERSION" not in text
     assert fake_pypi == []
+
+
+def test_explain_install_failure_without_a_version_checks_the_latest(fake_pypi):
+    # #736: an agent gets an answer, not an error, when the log names no version.
+    result = explain_failure(log=install_log("pip-no-version.log"), python="3.13", targets=["win-amd64"])
+    assert result["isError"] is False
+    (pkg,) = result["structuredContent"]["packages"]
+    assert (pkg["name"], pkg["version"], pkg["gaps"]) == ("nowheels", "0.9", ["3.13 win-amd64"])
+    assert any(
+        n.startswith(
+            "the log doesn't name the version of nowheels that failed to build; checked nowheels 0.9, the latest"
+        )
+        for n in result["structuredContent"]["notes"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -2365,7 +3161,30 @@ def test_explain_install_failure_never_echoes_the_logs_index(fake_pypi, name, be
     assert SENTINEL not in message
     assert message == mcp._LOG_ERRORS[kind or mcp.OTHER_INDEX]
     assert "WHEELGAP_INDEX_URL" in message and "check_package" in message
-    assert "--index-url" not in message
+    assert "JSON API" in message and "/pypi" in message
+    assert "wheelgap --from-log FILE --index-url URL -p PYTHON -t PLATFORM" in message
+    assert "shell" in message
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("check_package", {"name": "laggard", "version": "1.0"}),
+        (
+            "explain_install_failure",
+            {"log": "Looking in indexes: https://x.test/simple\n" + install_log("pip23-laggard.log")},
+        ),
+    ],
+)
+def test_package_lookup_rejects_simple_index_without_fetching(fake_pypi, monkeypatch, tool, arguments):
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://x.test/simple/")
+    (_, reply) = run(init(), call(tool, python="3.13", targets=["win-amd64"], **arguments))
+    result = reply["result"]
+    assert result["isError"] is True
+    message = result["content"][0]["text"]
+    assert "WHEELGAP_INDEX_URL points at a simple index" in message and "JSON API" in message
+    assert "[tool.wheelgap]" not in message and "from a shell" in message
     assert fake_pypi == []
 
 
@@ -3022,3 +3841,95 @@ def test_check_lockfile_selection_types_are_checked_before_requesting_roots(key,
     assert reply["result"]["isError"] is True
     expected = f"'{key}' must be " + ("true or false" if key in {"all_extras", "no_dev"} else "an array of strings")
     assert expected in reply["result"]["content"][0]["text"]
+
+
+def test_modern_relative_context_asks_the_client_for_its_roots(fake_pypi, tmp_path, monkeypatch):
+    # An absolute dockerfile with context "." must not read the server's working directory (another project's).
+    root, _ = two_projects(tmp_path, monkeypatch)
+    (root / "Dockerfile").write_text(INSTALLS_REQUIREMENTS, encoding="utf-8")
+    arguments = {"dockerfile": str(root / "Dockerfile"), "inputs": True, "context": "."}
+    message = roots_call(1)
+    message["params"] |= {"name": "check_dockerfile", "arguments": arguments}
+    (asked,) = run(message)
+    assert asked["result"]["resultType"] == "input_required"
+    assert not fake_pypi
+    message = roots_call(1, {"roots": [{"uri": root.as_uri()}]})
+    message["params"] |= {"name": "check_dockerfile", "arguments": arguments}
+    (reply,) = run(message)
+    data = reply["result"]["structuredContent"]
+    assert data["path"] == str(root.resolve()) and [g["name"] for g in data["gaps"]] == ["winonly"]
+
+
+def test_check_dockerfile_description_says_where_unseen_lines_are():
+    from wheelgap.mcp import TOOLS
+
+    [tool] = [tool for tool in TOOLS if tool["name"] == "check_dockerfile"]
+    assert "'dockerfile_warnings'" in tool["description"] and "summary.complete false" in tool["description"]
+
+
+@pytest.mark.usefixtures("index")
+def test_check_package_dependencies_conflict_translates_cli_advice(monkeypatch):
+    import test_deps
+
+    monkeypatch.setitem(test_deps.INDEX, "conflictroot", {"1.0": test_deps.release(requires=("x", "y"))})
+    (_, reply) = run(
+        init(),
+        call(
+            "check_package",
+            name="conflictroot",
+            version="1.0",
+            python="3.14",
+            targets=["win-arm64"],
+            dependencies=True,
+        ),
+    )
+    assert reply["result"]["isError"] is True
+    text = reply["result"]["content"][0]["text"]
+    assert "--deps" not in text
+    assert "call check_lockfile on it" in text
+
+
+def test_diff_lockfiles_pyproject_error_uses_mcp_tool_names(tmp_path):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["six==1.16.0"]\n', encoding="utf-8"
+    )
+    reqs = tmp_path / "requirements.txt"
+    reqs.write_text("six==1.16.0\n", encoding="utf-8")
+    (_, reply) = run(init(), call("diff_lockfiles", old=str(pyproject), new=str(reqs)))
+    assert reply["result"]["isError"] is True
+    text = reply["result"]["content"][0]["text"]
+    assert "check_lockfile()" not in text
+    assert "the wheelgap command" not in text
+    assert "so diff_lockfiles doesn't read it" in text
+    assert "check_lockfile checks a pyproject.toml" in text
+
+
+def test_diff_lockfiles_script_error_uses_mcp_tool_names(tmp_path):
+    script = tmp_path / "tool.py"
+    script.write_text('# /// script\n# dependencies = ["six==1.16.0"]\n# ///\nimport six\n', encoding="utf-8")
+    reqs = tmp_path / "requirements.txt"
+    reqs.write_text("six==1.16.0\n", encoding="utf-8")
+    (_, reply) = run(init(), call("diff_lockfiles", old=str(script), new=str(reqs)))
+    assert reply["result"]["isError"] is True
+    text = reply["result"]["content"][0]["text"]
+    assert "check_lockfile()" not in text
+    assert "the wheelgap command" not in text
+    assert "so diff_lockfiles doesn't read it" in text
+    assert "check_lockfile checks a script's # /// script block" in text
+
+
+def test_tool_result_translates_source_error_reaching_it_directly(monkeypatch):
+    from wheelgap.mcp import _HANDLERS
+    from wheelgap.sources import SourceError
+
+    def boom(_args):
+        raise SourceError("cached metadata missing; pass --online for this run")
+
+    monkeypatch.setitem(_HANDLERS, "check_lockfile", boom)
+    (_, reply) = run(init(), call("check_lockfile", path="uv.lock"))
+    result = reply["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "--online" not in text
+    assert "call again with offline: false" in text

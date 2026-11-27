@@ -1,6 +1,6 @@
 [project]
 name = "wheelgap"
-version = "0.13.0"
+version = "0.14.0"
 description = "Find the Python dependencies that have no prebuilt wheel for your target platform, before your Docker build does."
 readme = "README.md"
 license = "MIT"
@@ -49,7 +49,7 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.mypy]
-files = ["src"]
+files = ["src", "scripts/check_projects.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

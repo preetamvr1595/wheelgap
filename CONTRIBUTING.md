@@ -65,7 +65,7 @@ Using AI tools (coding agents, bug-fix bots and the like) is fine, and [AGENTS.m
 
 Found a package that wheelgap misjudges? Open a [bug report](https://github.com/wheelgap/wheelgap/issues/new?template=bug_report.yml) with the output of the same command plus `--explain`. It lists the wheel filenames and why each was rejected, which is everything needed to write a test, so you don't have to share your lockfile. If you checked the package with `pip download --only-binary=:all: --platform …`, paste that too: it settles who's right.
 
-## Checking wheelgap against pip
+## Checking wheelgap against pip and uv
 
 `scripts/check_against_pip.py` compares wheelgap with pip on about 50 real PyPI packages: for each package's latest release and each of its targets (manylinux and musllinux on x86_64 and aarch64, Windows on x86_64 and ARM, macOS on Apple silicon, free-threaded 3.14t and glibc 2.17), it asks pip what it would install (`pip install --dry-run --no-deps --only-binary=:all:`, which picks a file as `pip download` does but fetches only its metadata) with the tags [AGENTS.md](AGENTS.md#no-issue-fits-find-a-real-bug) lists, and checks that pip picks a wheel exactly when wheelgap says `wheel`. It needs the network and pip, and takes a few minutes:
 
@@ -73,9 +73,21 @@ Found a package that wheelgap misjudges? Open a [bug report](https://github.com/
 uv run --with pip python scripts/check_against_pip.py                 # everything
 uv run --with pip python scripts/check_against_pip.py numpy orjson    # just these packages
 uv run --with pip python scripts/check_against_pip.py -t win-arm64    # just this target (a platform or a label)
+uv run python scripts/check_against_pip.py --installer uv numpy       # compare with uv
 ```
 
-It prints a table of every disagreement, with the pip command that shows it, and exits 1 if there is any (2 if a check couldn't be made, for example because pip couldn't reach PyPI). The [Accuracy](.github/workflows/accuracy.yml) workflow runs it every Monday.
+The uv check uses `uv pip compile` to resolve the wheel without installing it. The report lists unsupported targets such as free-threaded 3.14t with a reason. Run it on a default (GIL) build of CPython, because uv takes the implementation and free-threaded ABI of its tags from the interpreter.
+
+Both checks ask wheelgap about a pin (`NAME==VERSION`), which wheelgap answers as pip installs it; a `uv.lock` it answers as uv does. pip and uv differ on one thing here: uv ignores an upper bound in `Requires-Python`, so it takes a wheel pip leaves out. The uv report lists such a check as not compared, with the reason, and it isn't a wheelgap error. Before filing any other disagreement with uv, check the same pin in the pip run.
+
+Both modes print the mismatch rate (disagreements out of the checks compared) and every disagreement with a command to reproduce it; `--json FILE` also writes the totals, the rate, per-target counts and each difference to a file. The script exits 1 if any comparison disagrees and 2 if a check failed (for example, PyPI was unreachable) or there were no comparable targets. The [Accuracy](.github/workflows/accuracy.yml) workflow runs both modes every Monday, puts each rate in the run's summary and keeps the two results files as an artifact.
+
+`scripts/check_projects.py` does the same for whole projects: a `uv.lock` with its `pyproject.toml`, or a fully pinned requirements file, read the way the project uses it (markers, forks, `[tool.uv] sources`, extras and `conflicts`, groups, `environments`, includes). For each input and target it compares which packages install, at which version, and whether each comes from a wheel, from source or not at all, with `uv sync --frozen --dry-run` for a `uv.lock` and with pip and `uv pip compile` (both `--only-binary :all:`) for a requirements file. Nothing from the project is run: its lock, `pyproject.toml` and requirements files are copied into a temporary folder and only read, a requirements file with any option but an index one (`--only-binary :none:`, `--find-links`, `-c`, ...) is refused, and the check stops if uv or pip starts a build. It writes `results.json` (every cell, with the referee command where it doesn't agree) and `report.txt` (agreement per target and input kind, disagreements grouped), and caches the referees' answers in the output folder, so a rerun on a new commit is quick. Not compared, each with its reason: `poetry.lock` files (no referee can install for another platform), a Python outside the project's `requires-python` (uv refuses it; wheelgap answers by design, and the script adds the newest Python the project allows), a project whose `required-version` needs a newer uv, requirement lines with markers against pip (pip evaluates them for the machine it runs on), pins whose sdist's `Requires-Python` leaves the target out against pip, and rows whose path in the lock turns on a marker uv's `--python-platform` only emulates (`platform_machine` on Windows x86_64, `platform_release`, `platform_version`, a patch-level `python_full_version`). The docstring has the details:
+
+```bash
+uv run --with pip python scripts/check_projects.py manifest CORPUS_DIR -o manifest.json   # inputs from a corpus folder
+uv run --with pip python scripts/check_projects.py run manifest.json -o results           # compare them all
+```
 
 ## Questions
 

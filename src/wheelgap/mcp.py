@@ -17,7 +17,8 @@ notifications/progress as its index lookups finish; a cancelled call sends no mo
 Tools (all read-only; they look packages up on PyPI, or the index in WHEELGAP_INDEX_URL):
 - check_package: one package (latest release or a given version) on each target.
 - check_lockfile: what `wheelgap PATH --json` reports, so project config, notes and skipped packages match the CLI.
-- check_dockerfile: what `wheelgap PATH --dockerfile DOCKERFILE --json` reports, plus the image it read.
+- check_dockerfile: what `wheelgap PATH --dockerfile DOCKERFILE --json` reports, plus the image it read; with inputs,
+  what `wheelgap --dockerfile DOCKERFILE --dockerfile-inputs --json` reports for the files the Dockerfile installs.
 - check_dist: what `wheelgap --dist DIR --json` reports for the release about to be uploaded, plus the targets
   the previous release on PyPI had a wheel for that this one drops.
 - diff_lockfiles: what `wheelgap diff OLD NEW --json` reports (the packages that got worse, and new ones with gaps).
@@ -56,12 +57,12 @@ from typing import Any, BinaryIO
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from . import __version__, origin, pypi
+from . import __version__, gapwheels, origin, pypi
 from . import suggest as release_suggest
 from .api import Result, check_package, check_packages, make_targets, running_python
 from .check import EXPLAIN_LIMIT, Status
 from .dockerfile import DockerfileError, read_dockerfile
-from .install_log import FIND_LINKS, NO_FAILURE, OTHER_INDEX, LogError, failed_builds
+from .install_log import FIND_LINKS, LATEST_NOTE, NO_FAILURE, OTHER_INDEX, LogError, failed_builds, ran_on_pypy
 from .pyodide import PyodideLockError, load_pyodide_lock
 from .sources import SourceError
 from .suggest_targets import suggest, to_json
@@ -185,6 +186,26 @@ _PYODIDE_LOCK_PROP = {
         "directory."
     ),
 }
+_FIX_HELP = (
+    "With fix: true, as --fix does, also says which gaps a wheel on wheelgap's gap wheel index fills: 'gap_wheels' "
+    "has one entry per filled gap cell (name, version, target, wheel, url, sha256; [] when none fits), "
+    "'gap_wheel_index' is the index to install from and 'gap_wheel_about' the page on how the wheels are built. "
+    "Each gap also gets 'fix', by target: kind 'upgrade' (a newer release has the wheel: version, how), 'gap_wheel' "
+    "or 'none' (reason), and 'fix_summary' counts them; an upgrade comes first, and wheelgap doesn't resolve, so the "
+    "rest of the dependencies must allow it. "
+    "It costs one request to wheelgap.github.io that names no package, plus one to pypi.org per gap package "
+    "positively from PyPI for its release list, as --suggest does. The wheels are unofficial: built by wheelgap "
+    "from the PyPI sdist, not by the package's maintainers, so tell the user that and ask before adding the index "
+    "to project files. It's off with another index (index-url or WHEELGAP_INDEX_URL: a note says so), and packages "
+    "wheelgap can't tell are PyPI's are never looked for. "
+)
+_FIX_PROP = {
+    "type": "boolean",
+    "description": "Also return each gap's fix (a newer release with the wheel first, then a gap wheel) and "
+    "gap_wheels: the gaps a wheel on wheelgap's gap wheel index fills, as --fix does (one request to "
+    "wheelgap.github.io that names no package, and one to pypi.org per gap package positively from PyPI; the wheels "
+    "are unofficial builds by wheelgap, so ask the user before adding the index). Default: false.",
+}
 _READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 
 TOOLS: list[dict[str, Any]] = [
@@ -248,14 +269,12 @@ TOOLS: list[dict[str, Any]] = [
             "requirements.txt, or a project directory containing one), exactly as the wheelgap command line does, and "
             "report the packages without a wheel on some target. Environment markers, .python-version and the "
             "project's [tool.wheelgap] settings (targets, python, glibc, ignore, offline, index-url, ...) apply; "
-            "arguments given here override them, except that offline = true in the project can't be turned off. "
+            "arguments given here override them. "
             "A uv.lock, poetry.lock or pdm.lock is checked for every extra and dependency group unless [tool.wheelgap] "
             "extras or groups select some, so it may report gaps the deployment never installs: match the deployment "
             "with extras, all_extras, groups, only_groups and no_dev (--extra, --all-extras, --group, --only-group, "
             "--no-dev), e.g. no_dev: true for a production install. A pyproject.toml's PEP 735 groups are checked "
             "only when groups or only_groups name them. "
-            "Notes and errors name command-line flags (--offline is the offline argument here, --deps the "
-            "dependencies argument). "
             "Packages from git, paths, URLs or private indexes are listed under "
             "'skipped': they were NOT checked. 'notes' says when an answer may be incomplete. Requirements files are "
             "looked up on the index; with dependencies: true, requirements files, a conda environment.yml, "
@@ -269,7 +288,7 @@ TOOLS: list[dict[str, Any]] = [
             "source builds. "
             "With two Pythons checked, one newer (e.g. python '3.14,next'), "
             "'blocking_newer_python' names the packages with a gap on the newer one only; it leaves out packages "
-            "that couldn't be checked. " + _STATUS_HELP
+            "that couldn't be checked. " + _FIX_HELP + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -295,7 +314,10 @@ TOOLS: list[dict[str, Any]] = [
                 | {"description": _PYODIDE_LOCK_PROP["description"] + " Default: [tool.wheelgap] pyodide-lock."},
                 "offline": {
                     "type": "boolean",
-                    "description": "Use only the files recorded in the lockfile; never contact the index.",
+                    "description": "True uses only files recorded in the lockfile and never contacts the index. "
+                    "False rechecks on the index and overrides offline = true for this call. "
+                    "False sends one index request per PyPI package. "
+                    "Omit to use the project's default.",
                 },
                 "extras": {
                     "type": "array",
@@ -332,6 +354,7 @@ TOOLS: list[dict[str, Any]] = [
                     "environment.yml, pyproject.toml and a script's # /// script block, "
                     "as --deps does. Default: false. Refused for lockfiles, offline and another index.",
                 },
+                "fix": _FIX_PROP | {"description": _FIX_PROP["description"] + " Refused with offline."},
             },
             "required": ["path"],
             "additionalProperties": False,
@@ -349,7 +372,16 @@ TOOLS: list[dict[str, Any]] = [
             "check_lockfile returns, plus 'image': the python, platform, glibc, musl and build_args wheelgap read "
             "from the Dockerfile (build_args maps the global ARGs used by FROM to their values). A Dockerfile "
             "wheelgap can't read the way Docker does is a tool error saying what to pass "
-            "instead. " + _STATUS_HELP
+            "instead. With inputs: true, as --dockerfile-inputs does, it checks the requirements files the "
+            "Dockerfile's final stage installs with RUN pip install -r FILE instead of a lockfile (so: will this "
+            "image build without compiling anything?); 'path' is then the build context, and notes (and "
+            "'dockerfile_inputs') name each file read and its line. Only a strict subset of Dockerfiles is read "
+            "that way: a line that may install anything else is a tool error naming the line, never a guess. A line "
+            "wheelgap can't see into (a script, "
+            "make) after the last install it reads is listed in 'dockerfile_warnings', with summary.complete false: "
+            "the packages it installs are not in the answer, so say so rather than calling the image fine. "
+            + _FIX_HELP
+            + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -362,7 +394,18 @@ TOOLS: list[dict[str, Any]] = [
                 "path": {
                     "type": "string",
                     "description": "Absolute path or file:// URI of the lockfile or project directory. Default: the "
-                    "Dockerfile's folder.",
+                    "Dockerfile's folder. Not with inputs: true.",
+                },
+                "inputs": {
+                    "type": "boolean",
+                    "description": "Check the requirements files the Dockerfile's final stage installs with RUN pip "
+                    "install -r FILE, instead of a lockfile, as --dockerfile-inputs does. Default: false.",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "With inputs: true, absolute path or file:// URI of the folder the build context "
+                    "starts from, as --dockerfile-context DIR (for `docker build -f docker/Dockerfile .`, the folder "
+                    "that `.` is). Default: the Dockerfile's folder.",
                 },
                 "build_args": {
                     "type": "object",
@@ -375,6 +418,7 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "Platforms to check instead of the image's, e.g. ['linux/arm64'] (with an Alpine "
                     "image, Docker platforms mean musl). Default: the image's platform."
                 },
+                "fix": _FIX_PROP,
             },
             "required": ["dockerfile"],
             "additionalProperties": False,
@@ -433,7 +477,9 @@ TOOLS: list[dict[str, Any]] = [
             "Pass the old lockfile as 'old' under its own file name, since the name says how to read it: e.g. `mkdir -p"
             " /tmp/old && git show HEAD:uv.lock > /tmp/old/uv.lock` (this works after the upgrade too, until it's "
             "committed). Unlike `wheelgap diff`, the project's [tool.wheelgap] settings don't apply: pass python, "
-            "targets and any version floors that differ from the defaults. " + _STATUS_HELP
+            "targets and any version floors that differ from the defaults. As in `wheelgap diff`, an index-url in "
+            "the [tool.wheelgap] beside either lockfile is a tool error, before any lookup: this tool checks PyPI "
+            "only, so check each lockfile with check_lockfile, which uses that index. " + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -464,18 +510,23 @@ TOOLS: list[dict[str, Any]] = [
             "wheelgap --from-log reads it: pip's 'Failed to build' summary, with each version from its Collecting, "
             "Downloading and Using cached lines; uv's 'Failed to build `NAME==VERSION`'; Poetry's build-backend "
             "note, normal or -v output; and pdm install -v output (PDM's normal output doesn't say which index a "
-            "package came from, so it's refused). Colour codes and GitHub Actions timestamps are fine. Each "
-            "package that failed to build (at most 50) is checked at the version the log names, as check_package "
-            "does with explain: true. Returns targets, ok (true only if every failed package installs without "
+            "package came from, so it's refused); pip's 'Getting requirements to build wheel', 'Preparing "
+            "metadata' and 'pip subprocess to install build dependencies' (pip 25.3+: 'installing build "
+            "dependencies for NAME') failures count, for the sdist "
+            "collected last. Colour codes, GitHub Actions timestamps and Docker BuildKit prefixes are fine. Each "
+            "package that failed to build (at most 50) is checked at the "
+            "version the log names (pip's lines, else an exact pin on a pip install line in the log; with no version "
+            "anywhere, the latest release, with a note saying so), as check_package does with explain: true. "
+            "Returns targets, ok (true only if every failed package installs without "
             "building on every target), packages (one entry per failed package, in the order the log names them, "
             "in check_package's shape: name, version, results, gaps, ok, rejected, rejected_omitted, via, direct, "
             "issues_url, and suggest and last_with_wheel when a gap's releases were looked up), assumes and notes "
             "(e.g. a failed package that has a wheel for a checked target: the log likely comes from another "
             "platform or Python). A log that can't be read with certainty is an error, never a guess: one that "
             "names no failed build, one where which version failed isn't clear, or one that installed from "
-            "another index than PyPI or with --find-links (unless the server's WHEELGAP_INDEX_URL is set: then "
-            "failures are checked on that index). The log is untrusted text: results and errors repeat no more of "
-            "it than package names and versions. " + _STATUS_HELP
+            "another index than PyPI or with --find-links, unless the server's WHEELGAP_INDEX_URL points to that "
+            "index's JSON API (e.g. .../pypi, not .../simple). The log is untrusted text: results and errors "
+            "repeat no more of it than package names and versions. " + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -575,8 +626,11 @@ def _platforms(args: dict[str, Any]) -> list[str]:
 
 
 def _pythons(args: dict[str, Any]) -> list[str]:
-    python = _string(args, "python") or ""
-    parts = [p.strip().lower() for p in python.split(",") if p.strip()]  # the CLI takes Next and 3.14T too
+    python = _string(args, "python")
+    parts = [p.strip().lower() for p in (python or "").split(",") if p.strip()]  # the CLI takes Next and 3.14T too
+    if python is not None and not parts:
+        # An empty argument ("" or ",") is the argument's fault, not a missing -p: omit it to take the default.
+        raise ToolError("'python' is empty: omit it to use the default Python, or pass a version like \"3.13\"")
     if bad := [p for p in parts if not _PYTHON_RE.fullmatch(p)]:
         raise ToolError(
             f"can't read Python version(s) {', '.join(map(repr, bad))} (expected e.g. '3.13', '3.14t' or 'next')"
@@ -676,6 +730,7 @@ def _check_package(args: dict[str, Any]) -> dict[str, Any]:
     except TargetError as e:
         raise ToolError(str(e)) from e
     lock_spec = _lock_spec(args)
+    pypi.check_index_url(simple_index_hint="To use a simple index, run `wheelgap NAME --index-url URL` from a shell.")
     try:
         locks = [load_pyodide_lock(lock_spec)] if lock_spec else []
     except ValueError as e:  # PyodideLockError, or a file that isn't UTF-8
@@ -698,7 +753,7 @@ def _check_package(args: dict[str, Any]) -> dict[str, Any]:
             result = check_package(name, version, targets, pyodide_locks=locks)
             asked = [result]
     except (PyodideLockError, SourceError) as e:  # a lock for a Python no pyodide target uses; an unsettled tree
-        raise ToolError(str(e)) from e
+        raise ToolError(_translate_cli_message(str(e).removeprefix("--deps: "))) from e
     out: dict[str, Any] = result.to_dict(explain=explain)
     if explain:
         _cap_rejected(out)
@@ -748,10 +803,13 @@ def _check_lockfile(args: dict[str, Any]) -> dict[str, Any]:
     """Run the command line itself with --json, so config, notes and skipped packages are exactly the CLI's."""
     _check_keys("check_lockfile", args)
     dependencies = _flag(args, "dependencies")
+    fix = _flag(args, "fix")
     raw = _string(args, "path", required=True) or ""
     offline = args.get("offline")
     if offline is not None and not isinstance(offline, bool):
         raise ToolError("'offline' must be true or false")
+    if fix and offline:  # as --offline --fix on the command line, before anything is read
+        raise ToolError("'fix' reads the gap wheel list from wheelgap.github.io, so it can't be used with 'offline'")
     environment = _string(args, "environment")
     path = _existing(raw)
     # --name=value forms, and -- before the path, so no value can be read as another option.
@@ -768,23 +826,39 @@ def _check_lockfile(args: dict[str, Any]) -> dict[str, Any]:
     argv += _version_flags(args)
     if lock_spec := _lock_spec(args):
         argv.append(f"--pyodide-lock={lock_spec}")
-    if offline:
-        argv.append("--offline")
+    if offline is not None:
+        argv.append("--offline" if offline else "--online")
     if dependencies:
         # The CLI writes a gap's 'via' only under --explain. Avoid --deps' automatic release suggestions and the
         # tracker's notes (they'd send the tree's names to wheelgap.github.io); the tool needs the paths only, and
         # _run_cli drops --explain's other keys.
         argv += ["--deps", "--explain", "--no-suggest", "--no-notes", "--no-build-info"]
-    return _run_cli(argv, path)
+    if fix:
+        argv.append("--fix")
+    return _run_cli(argv, path, lockfile=True)
 
 
 def _check_dockerfile(args: dict[str, Any]) -> dict[str, Any]:
     """check_lockfile with --dockerfile, plus the image the CLI reads from the Dockerfile."""
     _check_keys("check_dockerfile", args)
+    inputs = _flag(args, "inputs")
+    fix = _flag(args, "fix")
+    raw = (_string(args, "path") or "").strip()
+    raw_context = _string(args, "context")
+    # As on the command line: --dockerfile-inputs takes no INPUT, and --dockerfile-context is only read with it.
+    if inputs and raw:
+        raise ToolError("'inputs' takes the packages from the Dockerfile, so it can't be used with 'path'")
+    if raw_context is not None and not inputs:
+        raise ToolError("'context' is only used with 'inputs': pass inputs: true too")
+    # An empty context must not quietly fall back to the Dockerfile's folder, where another requirements.txt may sit.
+    if raw_context is not None and not raw_context.strip():
+        raise ToolError("'context' is empty: pass the build context's folder")
     dockerfile = _existing(_string(args, "dockerfile", required=True) or "")
     if dockerfile.is_dir():
         raise ToolError(f"{args['dockerfile']}: is a directory (pass the Dockerfile itself)")
-    raw = (_string(args, "path") or "").strip()
+    context = _existing(raw_context.strip()) if raw_context is not None else None
+    if context is not None and not context.is_dir():
+        raise ToolError(f"{raw_context}: is not a folder (pass the folder the build context starts from)")
     path = _existing(raw) if raw else dockerfile.parent
     build_args = args.get("build_args") or {}
     if not isinstance(build_args, dict) or not all(isinstance(v, str) for v in build_args.values()):
@@ -795,19 +869,27 @@ def _check_dockerfile(args: dict[str, Any]) -> dict[str, Any]:
     try:
         image = read_dockerfile(dockerfile, build_args)
     except DockerfileError as e:  # wheelgap's message; its CLI advice, where it gives some, translated
-        message = str(e).replace("pass -p/-t instead", "use check_lockfile with python and targets instead")
-        raise ToolError(message) from e
+        raise ToolError(_translate_cli_message(str(e))) from e
     except OSError as e:  # a Dockerfile that can't be read
         raise ToolError(f"{args['dockerfile']}: {e.strerror or e}") from e
     argv = ["--json", f"--dockerfile={dockerfile}"]
     argv += [f"--build-arg={name}={value}" for name, value in build_args.items()]
     argv += [f"--target={p}" for p in _platforms(args)]
-    try:
-        out = _run_cli(argv, path)
-    except ToolError as e:
-        if raw or "no lockfile found" not in str(e):
-            raise
-        raise ToolError(f"{e} (pass 'path': the lockfile or project directory)") from e
+    if fix:
+        argv.append("--fix")
+    if inputs:
+        argv.append("--dockerfile-inputs")
+        if context is not None:
+            argv.append(f"--dockerfile-context={context}")
+        # No input: the CLI takes the requirements files from the Dockerfile. 'path' is the build context.
+        out = _run_cli(argv, context if context is not None else dockerfile.parent, positional=False)
+    else:
+        try:
+            out = _run_cli(argv, path)
+        except ToolError as e:
+            if raw or "no lockfile found" not in str(e):
+                raise
+            raise ToolError(f"{e} (pass 'path': the lockfile or project directory)") from e
     out["image"] = {
         "python": image.python,
         "platform": image.platform,
@@ -815,16 +897,6 @@ def _check_dockerfile(args: dict[str, Any]) -> dict[str, Any]:
         "musl": image.musl,
         "build_args": dict(image.build_args),
     }
-    # The CLI flags cannot be passed to check_dockerfile: give the corresponding MCP tool advice instead.
-    out["notes"] = [
-        note.replace(
-            "pass --build-arg if the build sets one",
-            "pass build_args if the build sets --build-arg",
-        )
-        if "FROM uses the default of ARG " in note
-        else note
-        for note in out["notes"]
-    ]
     return out
 
 
@@ -881,6 +953,18 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
         targets = make_targets(_pythons(args) or None, _platforms(args) or None, **_versions(args))
     except TargetError as e:
         raise ToolError(str(e)) from e
+    pypi.check_index_url(
+        simple_index_hint="Set WHEELGAP_INDEX_URL to the JSON API of the index you want to compare against."
+    )
+    for path in paths:
+        # As `wheelgap diff` (#705), before any lookup: an index-url in [tool.wheelgap] beside either side would be
+        # ignored, and PyPI's answer given for a project that installs from that index (#710). The URL isn't named.
+        try:
+            diff._input_index_url(str(path), str(path))
+        except SourceError as e:
+            raise ToolError(_translate_cli_message(str(e))) from e
+    if not _platforms(args):  # as `wheelgap diff`: without the default platforms both locks leave out
+        targets = diff.lock_default_targets(paths, targets)[0]
     sides = []
     for path in paths:
         try:
@@ -889,8 +973,8 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
             results, source, _ = check_with_source(path, targets, online=False, offline=False)
         except OSError as e:  # a lockfile that can't be read
             raise ToolError(f"{path}: {e.strerror or e}") from e
-        except SourceError:
-            raise
+        except SourceError as e:
+            raise ToolError(_translate_cli_message(str(e))) from e
         except ValueError as e:  # malformed TOML or JSON, not UTF-8: the file's problem, not a bug here
             raise ToolError(f"{path}: {type(e).__name__}: {e}") from e
         packages = diff.merge(results, targets)
@@ -962,11 +1046,150 @@ _EXPLAIN_ONLY = frozenset(
         "piwheels",
         "suggest",
         "last_with_wheel",
+        "gap_wheel",
     }
 )
 
 
-def _run_cli(argv: list[str], path: Path, *, positional: bool = True, project: Path | None = None) -> dict[str, Any]:
+# The command line's advice in words an MCP client can act on: it has arguments, not flags (#607). Every error and
+# note of the tools that run the command line goes through this table. Only whole flags match (not --extra-index-url,
+# nor a path such as /srv/--fix/uv.lock), and what a Dockerfile or requirements file itself says (FROM --platform,
+# COPY --chown, pip's own options) is left alone.
+_CLI_ADVICE = {
+    "pass --online for this run": "call again with offline: false",
+    "drop --offline": "call without offline: true",
+    "drop --deps": "call without dependencies: true",
+    "add --deps": "call with dependencies: true",
+    "drop --fix": "call without fix: true",
+    # check_dist is the tool itself, so there is nothing to drop: the other way out is all that's left.
+    "drop --dist, or set": "set",
+    "pass -p/-t instead": "use check_lockfile with python and targets instead",
+    # FROM scratch: no flag stands in for an image wheelgap can't read the Python of, so the way out is the files.
+    "-p/-t don't stand in for it": "check the requirements files with check_lockfile, python and targets instead",
+    "pass -t and --glibc instead": "use check_lockfile with targets and glibc instead",
+    "pass --build-arg if the build sets one": "pass build_args if the build supplies a value",
+    # WHEELGAP_INDEX_URL is a JSON API mirror (pypi.check_index_url refuses /simple), not a simple index, so the advice
+    # for a simple index is index-url in [tool.wheelgap], which takes no credentials.
+    "pass the URL with --index-url from a CI secret instead": (
+        "an MCP tool can't take an index URL with credentials: set index-url in [tool.wheelgap] to one without "
+        "them, or run wheelgap --index-url from a shell"
+    ),
+    "To use a simple index, pass --index-url instead.": (
+        "To use a simple index, set index-url in [tool.wheelgap] (a URL without credentials) for the tools that "
+        "check a project's files."
+    ),
+    # wheelgap diff's refusal of [tool.wheelgap] index-url (diff._refuse_index_url), which diff_lockfiles shares.
+    "which wheelgap diff doesn't read yet, so it would check PyPI instead of that index; check each lockfile with "
+    "wheelgap instead, which uses it": (
+        "which diff_lockfiles doesn't read yet, so it would check PyPI instead of that index; check each lockfile "
+        "with check_lockfile instead, which uses it"
+    ),
+    "select targets with -t": "pass targets explicitly",
+    "add it to -t as well": "include it in targets as well",
+    "check a lockfile instead (uv lock, or pip-compile)": (
+        "make a lockfile (uv lock, or pip-compile) and call check_lockfile on it"
+    ),
+    # check_package's dependency tree past deps.MAX_PACKAGES.
+    "packages; check a lockfile instead": "packages; make a lockfile and call check_lockfile on it",
+    (
+        "so check_lockfile() and wheelgap.diff don't read it; pass a lockfile "
+        "(the wheelgap command checks a pyproject.toml)"
+    ): (
+        "so diff_lockfiles doesn't read it; pass lockfiles or requirements files "
+        "(check_lockfile checks a pyproject.toml)"
+    ),
+    (
+        "so check_lockfile() and wheelgap.diff don't read it; pass a lockfile "
+        "(the wheelgap command checks a script's # /// script block)"
+    ): (
+        "so diff_lockfiles doesn't read it; pass lockfiles or requirements files "
+        "(check_lockfile checks a script's # /// script block)"
+    ),
+    # A uv.lock checked with offline: false. The tools have no text report, and return pip_refuses with a gap only.
+    "(the text report's --explain says which, and --json lists the files in pip_refuses)": (
+        "(a package with a gap lists the files in its pip_refuses)"
+    ),
+    "--online": "offline: false",
+    "--offline": "offline: true",
+    "--deps": "the dependencies argument",
+    "--fix": "the fix argument",
+    "--extra": "extras",
+    "--all-extras": "all_extras",
+    "--group": "groups",
+    "--only-group": "only_groups",
+    "--no-dev": "no_dev",
+    "--environment": "the environment argument",
+    "--build-arg": "build_args",
+    "--dockerfile-inputs": "the inputs argument",
+    "--dockerfile-context": "the context argument",
+    "--dist": "check_dist",
+    "--ignore": "ignore in [tool.wheelgap]",
+    "(--index-url, or index-url in [tool.wheelgap])": "(index-url in [tool.wheelgap])",
+    # Over MCP only the [tool.wheelgap] value reaches the URL checks (pypi.check_index_url) and the notes that name
+    # another index. Bare --index-url, -t and -p aren't in the table: error text quotes requirements and Dockerfile
+    # lines (`pip ignores --index-url after a requirement`, mkdir -p, cp -t), so only wheelgap's own phrases change.
+    "(--index-url)": "(index-url in [tool.wheelgap])",
+    "--index-url is empty": "index-url in [tool.wheelgap] is empty",
+    "--index-url is not a valid URL": "index-url in [tool.wheelgap] is not a valid URL",
+    "--index-url must be an http(s) URL": "index-url in [tool.wheelgap] must be an http(s) URL",
+    "--index-url must use https": "index-url in [tool.wheelgap] must use https",
+}
+# The same advice from a tool that has no offline, dependencies or environment argument (check_dockerfile, check_dist).
+_CLI_ADVICE_ELSEWHERE = {
+    "pass --online for this run": "set offline = false in [tool.wheelgap]",
+    "add --deps": "use check_lockfile with dependencies: true",
+    "--environment": "check_lockfile's environment argument",
+}
+# A backslash before a flag is a Windows path (C:\srv\--fix\uv.lock), as / is elsewhere. A flag right after
+# "pip install " is the Dockerfile's own word (pip has --group too), not wheelgap's.
+_CLI_ADVICE_RE = re.compile(
+    r"(?<![\w/\\-])(?<!pip install )(?:" + "|".join(map(re.escape, _CLI_ADVICE)) + r")(?![\w/\\-])"
+)
+# Advice that names a Python version, so it can't be a fixed phrase above. check_dockerfile has no python argument:
+# the Python it checks is the image's, so the other way out of a `python3.12 -m pip` line is check_lockfile.
+_CLI_ADVICE_VERSIONED = [
+    (
+        re.compile(r"(?<![\w/\\-])try -p (\d+\.\d+t?) -t pyodide(?![\w/\\-])"),
+        r"try python '\1' with targets ['pyodide']",
+    ),
+    (
+        re.compile(r"(?<![\w/\\-])or check with -p (\d+\.\d+t?)(?![\w/\\-])"),
+        r"or call check_lockfile on the requirements files with python '\1', the image's platform as targets, and "
+        r"its glibc (or musl) version as glibc (or musl)",
+    ),
+]
+
+
+def _translate_cli_message(message: str, *, lockfile: bool = False) -> str:
+    """MESSAGE with the command line's flags as the calling tool's arguments. lockfile: the tool is check_lockfile,
+    which has the arguments the others lack."""
+
+    def replace(match: re.Match[str]) -> str:
+        # Inside `...` it is a command to run as written (`wheelgap PATH --group NAME`).
+        if message.count("`", 0, match.start()) % 2:
+            return match[0]
+        if not lockfile and match[0] in _CLI_ADVICE_ELSEWHERE:
+            return _CLI_ADVICE_ELSEWHERE[match[0]]
+        return _CLI_ADVICE[match[0]]
+
+    message = _CLI_ADVICE_RE.sub(replace, message)
+    for pattern, advice in _CLI_ADVICE_VERSIONED:
+
+        def versioned(match: re.Match[str], text: str = message, advice: str = advice) -> str:
+            return match[0] if text.count("`", 0, match.start()) % 2 else match.expand(advice)
+
+        message = pattern.sub(versioned, message)
+    return message
+
+
+def _run_cli(
+    argv: list[str],
+    path: Path,
+    *,
+    positional: bool = True,
+    project: Path | None = None,
+    lockfile: bool = False,
+) -> dict[str, Any]:
     """`wheelgap ARGV -- PATH` with --json in ARGV: its result as the lockfile tools return it. positional=False
     runs `wheelgap ARGV` with no input at all (check_dist: --dist takes none) and keeps PATH in the result; the
     settings then come from PROJECT, never the server's working directory (another project's)."""
@@ -974,7 +1197,9 @@ def _run_cli(argv: list[str], path: Path, *, positional: bool = True, project: P
 
     # --color=never: a dim() note under FORCE_COLOR starts with an ANSI escape instead of "wheelgap: ",
     # so it would be dropped from notes. _run_cli parses every tool's stderr, so set it here for all of them.
-    argv = ["--color=never", *argv]
+    # --no-quiet: a project's quiet = true would switch the notes off for the MCP client too, and the tools
+    # return those notes as their explanation (e.g. why gap_wheels is empty). --json doesn't depend on quiet.
+    argv = ["--color=never", "--no-quiet", *argv]
     argv = [*argv, "--", str(path)] if positional else argv
     out, err = io.StringIO(), io.StringIO()
     try:
@@ -982,12 +1207,20 @@ def _run_cli(argv: list[str], path: Path, *, positional: bool = True, project: P
             code = cli.main(argv, project=project)
     except SystemExit as e:  # argparse rejected a value
         code = e.code if isinstance(e.code, int) else 2
-    messages = [line.removeprefix("wheelgap: ") for line in err.getvalue().splitlines() if line.strip()]
-    notes = [m.removeprefix("note: ") for m in messages if m.startswith("note: ")]
+    messages = [
+        _translate_cli_message(line.removeprefix("wheelgap: "), lockfile=lockfile)
+        for line in err.getvalue().splitlines()
+        if line.strip()
+    ]
+    # A warning qualifies the answer (--dockerfile-inputs: a line wheelgap can't see into), so it is kept, marked.
+    notes = [m.removeprefix("note: ") for m in messages if m.startswith(("note: ", "warning: "))]
     # SystemExit is a BaseException: without the handler above it would end the server, not just this call.
     if code not in (0, 1):
-        errors = [m.removeprefix("error: ") for m in messages if not m.startswith("note: ")]
-        raise ToolError("; ".join(errors) or f"wheelgap exited with status {code}")
+        errors = [m.removeprefix("error: ") for m in messages if not m.startswith(("note: ", "warning: "))]
+        # An indented line continues the error above it (the files a directory leaves to choose from): it stays a
+        # line of its own.
+        text = "".join(("\n" if m.startswith(" ") else "; ") + m for m in errors).removeprefix("; ")
+        raise ToolError(text or f"wheelgap exited with status {code}")
     data = json.loads(out.getvalue())
     # The CLI leaves the Python out of labels when there's only one; always give it, as check_package does.
     label = {t["label"]: f"{t['python']} {t['platform']}" for t in data["targets"]}
@@ -1009,7 +1242,7 @@ def _run_cli(argv: list[str], path: Path, *, positional: bool = True, project: P
             # Apply the same label mapping to dependency paths, not just status cells.
             context = {
                 key: {label.get(t, t): value for t, value in package[key].items()}
-                for key in ("via", "direct")
+                for key in ("via", "direct", "fix")
                 if key in package
             }
             # --explain's other keys (rejected wheels, tracker notes, build needs...) keep the CLI's short labels and
@@ -1034,6 +1267,9 @@ def _run_cli(argv: list[str], path: Path, *, positional: bool = True, project: P
         # The command line's verdict: gaps on advisory targets (and, with fail-on = "missing", source builds) don't
         # fail it, so this can be true while ok is false.
         "passes": code == 0,
+        # --dockerfile-inputs: whether the answer covers every line, next to the verdict it qualifies, so an agent
+        # reading passes sees it.
+        **({"summary": {"complete": data["summary"]["complete"]}} if "complete" in data["summary"] else {}),
         "advisory": advisory,
         "unknown": sum(1 for g in gaps if Status.UNKNOWN.value in g["results"].values()),
         "bundled_version_differs": [
@@ -1045,22 +1281,39 @@ def _run_cli(argv: list[str], path: Path, *, positional: bool = True, project: P
         "ignored_targets": data["ignored_targets"],
         "notes": notes,
     } | ({"blocking_newer_python": data["blocking_newer_python"]} if "blocking_newer_python" in data else {})
+    # --dockerfile-inputs: the files each RUN line read and the lines wheelgap couldn't see into, as --json gives them.
+    for key in ("dockerfile_inputs", "dockerfile_warnings"):
+        if key in data:
+            result[key] = data[key]
     # --dist: targets the previous release had a wheel for that this one drops, labelled like results.
     if "dropped" in data:
         result["dropped"] = {label[k]: v for k, v in data["dropped"].items()}
+    # --fix: the gap cells a wheel on the gap wheel index fills, labelled like results, and where to install from.
+    if "gap_wheels" in data:
+        result["gap_wheels"] = [wheel | {"target": label[wheel["target"]]} for wheel in data["gap_wheels"]]
+        result["gap_wheel_index"] = gapwheels.INDEX
+        result["gap_wheel_about"] = gapwheels.ABOUT
+    if "fix_summary" in data:  # --fix: how many gap cells an upgrade, a gap wheel or nothing fixes
+        result["fix_summary"] = data["fix_summary"]
     return result
 
 
 _LOG_MAX_BYTES = 1024 * 1024  # of UTF-8: the end of a failed install, not a CI job's whole log
+_LOG_SIMPLE_INDEX_HINT = (
+    "To use a simple index, run `wheelgap --from-log FILE --index-url URL -p PYTHON -t PLATFORM` from a shell."
+)
+_LOG_INDEX_ADVICE = (
+    "Set WHEELGAP_INDEX_URL in the server's environment to the JSON API of the index the packages came from "
+    f"(e.g. .../pypi, not .../simple). {_LOG_SIMPLE_INDEX_HINT} "
+    "For a package you know comes from PyPI, call check_package with its name and version."
+)
 # The tool's own words for the refusals whose --from-log message quotes the log (its index and --find-links URLs),
 # and for a log with no failure: an agent calls the tool because an install failed, so that isn't a pass.
 _LOG_ERRORS = {
     OTHER_INDEX: "the log installed from another index than PyPI, so its packages may not be PyPI's (the index "
-    "isn't repeated here). To check them on that index, set WHEELGAP_INDEX_URL to it in the server's environment; "
-    "for a package you know comes from PyPI, call check_package with its name and version.",
+    "isn't repeated here). " + _LOG_INDEX_ADVICE,
     FIND_LINKS: "the log installed with --find-links, so its packages may not be PyPI's (the links aren't repeated "
-    "here). To check them on the index they came from, set WHEELGAP_INDEX_URL to it in the server's environment; "
-    "for a package you know comes from PyPI, call check_package with its name and version.",
+    "here). " + _LOG_INDEX_ADVICE,
     NO_FAILURE: "found no package that failed to build in the log (pip's 'Failed to build NAME', uv's 'Failed to "
     "build `NAME==VERSION`', or a Poetry or pdm install -v build failure): pass the whole log of the install that "
     "failed",
@@ -1086,6 +1339,7 @@ def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
         message = str(e).removeprefix("--from-log: ")
         message = re.sub(r"check (\S+)==VERSION directly", r"call check_package for \1 with the version", message)
         raise ToolError(message) from e
+    pypi.check_index_url(simple_index_hint=_LOG_SIMPLE_INDEX_HINT)
     results = check_packages(failures, targets)
     ways = _suggestions(results)  # one look_up_all for every failed package
     packages: list[dict[str, Any]] = []
@@ -1097,7 +1351,16 @@ def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
             f"the log doesn't say which Python and platform the install ran on, so this checked {' and '.join(assumed)}"
             ": pass python and targets for the machine the install ran on"
         )
+    on_pypy = ran_on_pypy(log)
+    if on_pypy:
+        notes.append(
+            "the install log's build ran on PyPy, and wheelgap checks CPython wheels only: the answers are for "
+            "CPython and don't say why the build failed there (PyPy wheels carry pp tags, such as pp311, not cp ones)"
+        )
+    unversioned = {canonicalize_name(name) for name, version in failures if version is None}
     for r in results:
+        if canonicalize_name(r.name) in unversioned and r.version:
+            notes.append(LATEST_NOTE.format(name=r.name, version=r.version))
         out: dict[str, Any] = r.to_dict(explain=True)
         _cap_rejected(out)
         out["ok"] = r.ok
@@ -1105,7 +1368,7 @@ def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
         if (way := ways.get(id(r))) is not None:
             out.update(_way_out(way))
         packages.append(out)
-        if fits := [t.label(True) for t, status in r.statuses.items() if status is Status.WHEEL]:
+        if not on_pypy and (fits := [t.label(True) for t, status in r.statuses.items() if status is Status.WHEEL]):
             # As --from-log's note: a wheel for a checked target means the install didn't run there.
             notes.append(
                 f"the install log says {r.name} failed to build, but {r.name} {r.version} has a wheel for "
@@ -1524,7 +1787,11 @@ class Server:
                 data["notes"] = [*data.get("notes", []), *notes]
             text = json.dumps(data, indent=1)
         except (ToolError, TargetError, SourceError) as e:
-            text = str(e)
+            text = (
+                str(e)
+                if isinstance(e, ToolError)
+                else _translate_cli_message(str(e), lockfile=name == "check_lockfile")
+            )
             if notes:
                 text += "\n\n" + "\n".join(notes)
             return {"content": [{"type": "text", "text": text}], "isError": True}
@@ -1558,7 +1825,7 @@ def _complete(result: dict[str, Any], result_type: str = "complete") -> dict[str
 _PATH_ARGUMENTS = {
     "check_package": ("pyodide_lock",),
     "check_lockfile": ("path", "pyodide_lock"),
-    "check_dockerfile": ("dockerfile", "path"),
+    "check_dockerfile": ("dockerfile", "path", "context"),
     "check_dist": ("path",),
     "diff_lockfiles": ("old", "new"),
     "suggest_targets": ("path",),

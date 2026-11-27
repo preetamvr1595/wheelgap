@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import platform
@@ -19,7 +20,7 @@ from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
-from . import __version__, cache, condaforge, gapwheels, origin, piwheels
+from . import __version__, cache, condaforge, fix, gapwheels, origin, piwheels
 from . import notes as tracker
 from . import suggest as release_suggest
 from .api import explain_issues_urls, running_python
@@ -32,18 +33,33 @@ from .check import (
     Row,
     Status,
     check,
+    check_lock_environments,
     dropped_targets,
     explain,
     explain_lines,
+    lock_environment_targets,
+    lock_environments_note,
     marker_holds,
+    narrow_to_lock_environments,
     reachable,
 )
 from .codequality import write_codequality
 from .constraints import write_constraints
 from .deps import Resolver, pinned_complete, resolve_deps
-from .dockerfile import DockerfileError, dockerfile_requirements, read_dockerfile
-from .github import github_annotations
-from .install_log import failed_builds, log_source, read_log
+from .dockerfile import (
+    _PIP_PYLOCK_NAME_RE,
+    PASSED_OVER,
+    PYTORCH_INDEX,
+    DockerfileError,
+    HeredocSyntaxError,
+    ImageTarget,
+    InputsReport,
+    UnknownImageError,
+    dockerfile_requirements,
+    read_dockerfile,
+)
+from .github import github_annotations, relative_path, workflow_command
+from .install_log import LATEST_NOTE, failed_builds, log_source, ran_on_pypy, read_log
 from .junit import write_junit
 from .logsafe import guarded_output, write_command
 from .offline import require_offline, undo_offline
@@ -55,21 +71,37 @@ from .pyodide import (
     check_targets,
     load_pyodide_lock,
 )
-from .pypi import check_index_url, fill_all, keeps_locked_files, previous_release, recheck_lock, split_credentials
+from .pypi import (
+    apply_locked_python_ranges,
+    check_index_url,
+    fill_all,
+    keeps_locked_files,
+    previous_release,
+    recheck_lock,
+    split_credentials,
+)
 from .sarif import write_sarif
 from .sources import (
+    DirectoryChoiceError,
+    DirectoryInput,
     Package,
     Source,
     SourceError,
     UvSelection,
+    _command,
     check_report_targets,
     load_inputs,
     parse_dist,
+    parse_named_requirements,
+    pyproject_group_names,
     pythons_outside_lock,
+    requirement_to_package,
+    restore_uv_python_files,
     select_pyproject_extras,
     select_pyproject_groups,
     select_uv_dependencies,
     skipped_list,
+    tool_table,
     uv_selected_roots,
 )
 from .suggest_targets import render_text as render_target_suggestions
@@ -97,6 +129,7 @@ from .targets import (
     next_python_note,
     parse_api_level,
     parse_ios_version,
+    parse_python,
     parse_version_pair,
     resolve_distro,
     resolve_platform,
@@ -202,6 +235,11 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with --dockerfile, check the requirements files its final stage installs with RUN pip install -r FILE "
         "(a strict subset of Dockerfiles: anything else that may install packages is an error naming its line)",
+    )
+    p.add_argument(
+        "--dockerfile-context",
+        metavar="DIR",
+        help="with --dockerfile-inputs, the folder the build context starts from (default: the Dockerfile's folder)",
     )
     p.add_argument(
         "--build-arg",
@@ -316,9 +354,10 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--fix",
         action="store_true",
-        help="also say which gaps a wheel on wheelgap's gap wheel index fills, and how to install from it (reads "
-        "the index's list from wheelgap.github.io, which sends no package names, and keeps it in the 24-hour cache; "
-        "not with --offline, and off with --index-url or a WHEELGAP_INDEX_URL mirror)",
+        help="also say how to fix each gap: upgrade to the nearest newer release with the wheel (looks the PyPI "
+        "packages with gaps up on pypi.org, as --suggest does), else an unofficial wheel from wheelgap's gap wheel "
+        "index (reads its list from wheelgap.github.io, which sends no package names, and keeps it in the 1-hour "
+        "cache); not with --offline, and off with --index-url or a WHEELGAP_INDEX_URL mirror",
     )
     p.add_argument(
         "--print-gap-wheel-snippet",
@@ -464,7 +503,7 @@ def load_config(path: Path) -> dict:
         text = path.read_text(encoding="utf-8-sig")  # -sig: Windows editors add a BOM
     except UnicodeDecodeError:
         raise SourceError(f"{path}: isn't UTF-8, so its [tool.wheelgap] table can't be read") from None
-    table = tomllib.loads(text).get("tool", {}).get("wheelgap", {})
+    table = tool_table(tomllib.loads(text), path).get("wheelgap", {})
     if not isinstance(table, dict):
         raise SourceError(f"{path}: [tool.wheelgap] must be a table")
     config = {}
@@ -474,6 +513,13 @@ def load_config(path: Path) -> dict:
                 value = [value]
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be a list of strings")
+            if key == "python" and any(not any(p.strip() for p in v.split(",")) for v in value):
+                # `python = ""` (or a stray "" or "," in the list) is the setting's fault, not -p's: the run never
+                # sees -p. An empty list is "not set" and takes the default Python, as before.
+                raise SourceError(
+                    f"{path}: [tool.wheelgap] python is empty: remove it to use the default, or list versions "
+                    'like ["3.13"]'
+                )
         elif key in STR_KEYS:
             if key == "android-api" and isinstance(value, int) and not isinstance(value, bool):
                 value = str(value)  # an API level is naturally written as a number
@@ -502,7 +548,7 @@ def load_config(path: Path) -> dict:
 def load_uv_targets(path: Path, pythons: list[str]) -> list[str]:
     """Native platforms needed by any required-environments marker for any selected Python."""
     # -sig: load_config() has already read this file, so only a BOM is left to allow for
-    table = tomllib.loads(path.read_text(encoding="utf-8-sig")).get("tool", {}).get("uv", {})
+    table = tool_table(tomllib.loads(path.read_text(encoding="utf-8-sig")), path).get("uv", {})
     if not isinstance(table, dict):
         raise SourceError(f"{path}: [tool.uv] must be a table")
     markers = table.get("required-environments", [])
@@ -818,11 +864,13 @@ def render_explain(
     issues_urls: dict[int, str | None] | None = None,
     published_wheels: list[gapwheels.Fill] | None = None,
     pi_wheels: dict[int, piwheels.Hint] | None = None,
+    upgrades: dict[tuple[int, Target], str] | None = None,
 ) -> list[str]:
     """`conda_forge`: --conda-forge hints, `piwheels`: --piwheels hints, `build_info`: --build-info answers and
     `suggestions`: --suggest's, by id() of the row's package. `notes` and `builds` (the tracker's build lab results):
     --notes, by id() of the row. `published_wheels`: --fix's fills (from the gap wheel list, which may come from the
-    24-hour cache), shown once per release under its first filled target."""
+    1-hour cache), shown once per release under its first filled target. `upgrades`: --fix's, the release to move to by
+    (id(row), target), shown first under each target it fixes."""
     multi_py = len({t.python for t in targets}) > 1
     filled: dict[int, list[gapwheels.Fill]] = {}
     for fill in published_wheels or []:
@@ -857,13 +905,19 @@ def render_explain(
                 align=True,
                 no_binary=r.package.no_binary,
                 only_binary=r.package.only_binary,
+                hash_rejected=r.package.hash_rejected,
             )
             out += [f"  {line}" for line in lines]
             if ask:
                 out.append(f"  ask for a wheel: {ask}")
                 ask = None
+            if (upgrade := (upgrades or {}).get((id(r), t))) is not None:
+                out.append(
+                    f"  upgrade: {r.package.name} {upgrade} has the wheel (an official release; see the --fix section)"
+                )
             if gap_wheel and any(f.target == t for f in gap_wheel):
-                out += [f"  {line}" for line in gapwheels.explain_lines(gap_wheel, multi_py)]
+                fallback = any((id(r), f.target) in (upgrades or {}) for f in gap_wheel)
+                out += [f"  {line}" for line in gapwheels.explain_lines(gap_wheel, multi_py, fallback)]
                 gap_wheel = None
             out.append("")
         if conda_forge and (h := conda_forge.get(id(r.package))):
@@ -984,6 +1038,14 @@ def report_json(
     issues_urls: dict[int, str | None] | None = None,
     gap_wheels: list[gapwheels.Fill] | None = None,
     pi_wheels: dict[int, piwheels.Hint] | None = None,
+    fix_cells: list[fix.Cell] | None = None,
+    dockerfile_inputs: list[dict[str, str | int | list[str]]] | None = None,
+    dockerfile_notes: list[dict[str, object]] | None = None,
+    dockerfile_warnings: list[dict[str, object]] | None = None,
+    dockerfile_packages: list[dict[str, object]] | None = None,
+    directory_inputs: list[dict[str, object]] | None = None,
+    image_unread: bool = False,
+    from_log_notes: list[dict[str, str]] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -996,9 +1058,13 @@ def report_json(
             "error": r.package.error,
             "results": {t.label(multi_py): r.results[t].value for t in targets},
         }
+        if fix_cells is not None:  # --fix: by gap target, its way out (an upgrade, a gap wheel or none)
+            out["fix"] = {c.target.label(multi_py): fix.to_json(c) for c in fix_cells if c.row is r}
         if pyodide_lock and Status.BUNDLED in r.results.values():
             out["bundled"] = pyodide_lock.packages[r.package.key]
             out["bundled_version_differs"] = bundled_version_differs(r.package, pyodide_lock)
+        if r.package.pip_refuses:
+            out["pip_refuses"] = r.package.pip_refuses
         if explained:
             out["rejected"] = {
                 t.label(multi_py): [
@@ -1010,6 +1076,7 @@ def report_json(
                         r.package.requires_python_rejected,
                         no_binary=r.package.no_binary,
                         only_binary=r.package.only_binary,
+                        hash_rejected=r.package.hash_rejected,
                     )
                 ]
                 for t in gap_targets(r, targets)
@@ -1085,13 +1152,195 @@ def report_json(
             "packages": len(_group_rows(rows)),
             "with_gaps": len(_group_rows(gaps)),
             "per_target": target_counts(gaps, targets),
+            # --dockerfile-inputs: false when a line wheelgap couldn't see into may install more (dockerfile_warnings).
+            # Also false when -p and -t stood in for an image wheelgap couldn't read.
+            **({"complete": not dockerfile_warnings and not image_unread} if dockerfile_warnings is not None else {}),
         },
     }
     if blocking is not None:
         report["blocking_newer_python"] = blocking.names
     if gap_wheels is not None:  # --fix: one entry per gap cell a wheel on the gap wheel index fills
         report["gap_wheels"] = gapwheels.to_json(gap_wheels, multi_py)
+    if fix_cells is not None:  # --fix: how many gap cells an upgrade, a gap wheel or nothing fixes
+        report["fix_summary"] = fix.counts(fix_cells)
+    if dockerfile_inputs is not None:
+        report["dockerfile_inputs"] = dockerfile_inputs
+    if dockerfile_notes:
+        report["dockerfile_notes"] = dockerfile_notes
+    if dockerfile_packages:
+        report["dockerfile_packages"] = dockerfile_packages
+    if dockerfile_warnings is not None:  # with --dockerfile-inputs, always: an empty list says nothing was unseen
+        report["dockerfile_warnings"] = dockerfile_warnings
+    if directory_inputs:  # an input was a directory: the file read from each, and why
+        report["directory_inputs"] = directory_inputs
+    if from_log_notes is not None:  # --from-log: a failed package checked at a version the log doesn't name
+        report["from_log_notes"] = from_log_notes
     return json.dumps(report, indent=2)
+
+
+def _line_list(lines: list[int]) -> str:
+    return f"line{'s' if len(lines) != 1 else ''} {', '.join(str(line) for line in sorted(lines))}"
+
+
+def dockerfile_report_notes(
+    dockerfile: str, report: InputsReport
+) -> tuple[list[dict[str, object]], list[dict[str, object]], str]:
+    """(--json's dockerfile_notes entries, its dockerfile_warnings entries, the line that closes the text report)
+    for what --dockerfile-inputs didn't read. The notes are what it passed over because it can't install Python
+    packages with pip or uv, one per class; the warnings are the lines it can't see into, which may."""
+    notes: list[dict[str, object]] = []
+    for kind, what in PASSED_OVER.items():
+        if lines := report.passed_over.get(kind):
+            if kind == "programs":
+                what += f" ({', '.join(report.programs)})"
+            # A copy from another stage isn't known to hold no packages: it is only not followed.
+            why = (
+                "not followed"
+                if kind == "copy-from"
+                else "not read, since they install no Python packages with pip or uv"
+            )
+            notes.append(
+                {
+                    "dockerfile": dockerfile,
+                    "line": None,
+                    "kind": f"passed-over:{kind}",
+                    "message": f"{why}: {what}, {_line_list(lines)}",
+                    "lines": sorted(lines),
+                }
+            )
+    if lines := report.passed_over.get("installer-tools"):
+        notes.append(
+            {
+                "dockerfile": dockerfile,
+                "line": None,
+                "kind": "passed-over:installer-tools",
+                "message": f"{_line_list(lines)} install or upgrade installer tools ({', '.join(report.tools)}): "
+                "these and what they depend on aren't checked, and the pip version the later lines run isn't known "
+                "(wheelgap answers for a current pip)",
+                "lines": sorted(lines),
+            }
+        )
+    if report.system_python:
+        lines = sorted({line for line, _ in report.system_python})
+        names = list(dict.fromkeys(name for _, name in report.system_python))
+        listed = ", ".join(names[:3]) + (", …" if len(names) > 3 else "")
+        notes.append(
+            {
+                "dockerfile": dockerfile,
+                "line": None,
+                "kind": "system-python-packages",
+                "message": f"{_line_list(lines)} install{'s' if len(lines) == 1 else ''} Python packages with the "
+                f"system package manager ({listed}): pip keeps one of those when it satisfies a requirement, and "
+                "wheelgap checks every requirement as a fresh install, so it may report a gap the build doesn't have",
+                "lines": lines,
+            }
+        )
+    for line, kind, message in report.notes:
+        notes.append({"dockerfile": dockerfile, "line": line, "kind": kind, "message": message})
+    warnings: list[dict[str, object]] = [
+        {
+            "dockerfile": dockerfile,
+            "line": line,
+            "kind": "may-install",
+            "message": f"this line runs {what}. If it installs Python packages, or another Python, "
+            "that is not in this answer",
+        }
+        for line, what in report.warnings
+    ]
+    warnings += [
+        {
+            "dockerfile": dockerfile,
+            "line": line,
+            "kind": "may-bring",
+            "message": (
+                f"{what} copies files from another stage or image, which wheelgap doesn't follow"
+                if what.startswith("COPY")
+                else f"{what}, and wheelgap doesn't follow such files"
+            )
+            + ". If they hold Python packages, or another Python, that is not in this answer",
+        }
+        for line, what in report.copied
+    ]
+    warnings += [
+        {
+            "dockerfile": dockerfile,
+            "line": line,
+            "kind": "may-install",
+            "message": f"this install uses {PYTORCH_INDEX}, which wheelgap doesn't read; "
+            "its packages and their dependencies aren't checked",
+        }
+        for line in report.pytorch_lines
+    ]
+    order = sorted({line for line, _ in (*report.warnings, *report.copied)} | set(report.pytorch_lines))
+    warnings.sort(key=lambda entry: order.index(entry["line"]))  # type: ignore[arg-type]
+    unseen = ""
+    if order:
+        one = len(order) == 1
+        does = f"run{'s' * one} commands wheelgap can't see into" if report.warnings else ""
+        if report.copied:
+            does += (", or " if does else "") + f"cop{'ies' if one else 'y'} files from another stage or image"
+        brought = "bring" if report.copied else "install"
+        if report.pytorch_lines:
+            unseen = f"{dockerfile}: {unseen_lines(order)}; those installs aren't fully covered by this answer."
+        else:
+            unseen = (
+                f"{dockerfile} {_line_list(order)} {does}: any Python packages they {brought} are not in this answer."
+            )
+    return notes, warnings, unseen
+
+
+# The dockerfile_notes kinds that qualify the whole answer (what the image is), shown in every output: --markdown,
+# --github-annotations and --sarif as well as stderr and --json.
+IMAGE_NOTE_KINDS = ("image-not-read", "image-libc")
+
+
+def dockerfile_results(
+    notes: list[dict[str, object]],
+    warnings: list[dict[str, object]] = [],  # noqa: B006 (only read)
+) -> list[tuple[str, str, int | None, str]]:
+    """(level, Dockerfile, line, message) for each Dockerfile note and warning that every output shows: the notes on
+    the image, then the warnings on lines --dockerfile-inputs couldn't see into."""
+    return [
+        (
+            level,
+            str(entry["dockerfile"]),
+            entry["line"] if isinstance(entry["line"], int) else None,
+            str(entry["message"]),
+        )
+        for level, entries in (("note", notes), ("warning", warnings))
+        for entry in entries
+        if level == "warning" or entry["kind"] in IMAGE_NOTE_KINDS
+    ]
+
+
+def dockerfile_markdown(results: list[tuple[str, str, int | None, str]]) -> list[str]:
+    """--markdown's lines for dockerfile_results: a quoted line each, after the report."""
+    lines = []
+    for level, file, line, message in results:
+        where = file if line is None else f"{file}:{line}"
+        lines += ["", f"> **{level.capitalize()}:** {_md(where)}: {_md(message)}"]
+    return lines
+
+
+def unseen_lines(lines: list[int]) -> str:
+    """`line 8 wasn't seen into`: the Dockerfile lines a --dockerfile-inputs answer doesn't cover."""
+    return f"{_line_list(lines)} {'was' if len(lines) == 1 else 'were'}n't seen into"
+
+
+def dockerfile_qualifiers(warnings: list[dict[str, object]], image_unread: bool) -> list[str]:
+    """What a --dockerfile-inputs answer doesn't cover, for its headline: the lines wheelgap couldn't see into, and
+    an image -p and -t stood in for."""
+    qualifiers = []
+    if warnings:
+        qualifiers.append(unseen_lines(sorted({int(str(entry["line"])) for entry in warnings})))
+    if image_unread:
+        qualifiers.append("the image wasn't read (-p and -t stand in for it)")
+    return qualifiers
+
+
+def read_packages(count: int) -> str:
+    """`The 3 packages wheelgap read have`: a headline that says the answer is for what was read, not the image."""
+    return f"The {count} package{'s' * (count != 1)} wheelgap read {'has' if count == 1 else 'have'}"
 
 
 def libc_versions(args: argparse.Namespace, config: dict) -> tuple[str, str]:
@@ -1283,18 +1532,32 @@ def render_markdown(
     dropped: dict[str, str] | None = None,
     issues_urls: dict[int, str | None] | None = None,
     pi_wheels: dict[int, piwheels.Hint] | None = None,
+    fix_hint: str | None = None,
+    not_covered: list[str] | None = None,
 ) -> list[str]:
-    """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
+    """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment).
+    `not_covered` says what a --dockerfile-inputs answer doesn't cover (dockerfile_qualifiers): the headline then
+    says so."""
     plain = Style(False)
     gaps = [r for r in rows if not r.ok]
     total_pkgs = len(_group_rows(rows))
     gap_pkgs = len(_group_rows(gaps))
     n_t = len(targets)
+    not_seen = "".join(f"; {qualifier}" for qualifier in not_covered or ())
     if gaps:
         noun = "package" if total_pkgs == 1 else "packages"
-        out = [f"### wheelgap: {gap_pkgs} of {total_pkgs} {noun} {'has' if gap_pkgs == 1 else 'have'} gaps", ""]
+        out = [
+            f"### wheelgap: {gap_pkgs} of {total_pkgs} {noun} {'has' if gap_pkgs == 1 else 'have'} gaps{not_seen}",
+            "",
+        ]
     elif not rows:  # "every package" reads like a success when the run checked nothing
         out = ["### wheelgap: no packages to check", ""]
+    elif not_covered:
+        out = [
+            f"### wheelgap: {read_packages(total_pkgs).lower()} a wheel for {'all ' if n_t > 1 else ''}{n_t} "
+            f"target{'s' * (n_t > 1)}{apart_from_ignored(rows)}{not_seen}",
+            "",
+        ]
     else:
         out = [
             f"### wheelgap: every package has a wheel for {'all ' if n_t > 1 else ''}{n_t} target{'s' * (n_t > 1)}"
@@ -1378,6 +1641,8 @@ def render_markdown(
                     ]
             if sug_lines:
                 out += [*sug_lines, ""]
+    if fix_hint:
+        out += [fix_hint, ""]
     return out
 
 
@@ -1430,9 +1695,70 @@ def split_ignore_value(value: str, how: str, docker_musl: bool) -> list[tuple[st
     return out
 
 
+def directory_notes(found: DirectoryInput) -> list[str]:
+    """What to say when a directory's input isn't simply its first lockfile: which file was read, and why."""
+    passed = "; ".join(f"{path} has {why}" for path, why in found.empty)
+    instead = [f"{passed}, so {found.path} was checked instead"] if found.empty else []
+    if found.reason == "subfolder":
+        return [
+            f"no lockfile, requirements.txt or pyproject.toml dependencies at the root of {found.directory}, so the "
+            f"only input in its subfolders, {found.path.parent if found.empty else found.path}, was checked",
+            *instead,
+        ]
+    if found.empty:
+        return instead
+    if found.reason == "pyproject":
+        lines = [f"no lockfile and no file named requirements.txt in {found.directory}, so {found.path} was checked"]
+        # The other requirements files there, as commands: the first 3 (those that look compiled first), then a count.
+        named, more = found.other_requirements[:3], len(found.other_requirements) - 3
+        for path, compiled in named:
+            if compiled:
+                lines.append(
+                    f"{path.relative_to(found.directory).as_posix()} looks compiled and pinned: "
+                    f"`{_command(path)}` checks what it pins"
+                )
+        rest = [f"`{_command(path)}`" for path, compiled in named if not compiled]
+        if more > 0:
+            rest.append(f"{more} more")
+        if rest:
+            listed = rest[0] if len(rest) == 1 else ", ".join(rest[:-1]) + f" and {rest[-1]}"
+            lines.append(f"other requirements files there: {listed}")
+        return lines
+    if found.reason == "requirements":
+        return [
+            f"no lockfile, requirements.txt or pyproject.toml dependencies in {found.directory}, so its only "
+            f"requirements file, {found.path}, was checked"
+        ]
+    return []
+
+
+def directory_inputs_json(sources: list[Source]) -> list[dict[str, object]]:
+    """--json's directory_inputs: for each directory input, the file that was read and why."""
+
+    def relative(found: DirectoryInput, path: Path) -> str:
+        return path.relative_to(found.directory).as_posix()
+
+    return [
+        {
+            "directory": str(found.directory),
+            "file": relative(found, found.path),
+            "reason": found.reason,
+            "empty": [{"file": relative(found, path), "why": why} for path, why in found.empty],
+            "other_requirements": [
+                {"file": relative(found, path), "compiled": compiled} for path, compiled in found.other_requirements
+            ],
+        }
+        for source in sources
+        if (found := source.found) is not None
+    ]
+
+
 def input_error_json(e: Exception) -> int:
     """With --json, also put an input error on stdout so scripts don't have to parse stderr."""
-    print(json.dumps({"error": {"message": str(e), "type": type(e).__name__}}))
+    error: dict[str, object] = {"message": str(e), "type": type(e).__name__}
+    if isinstance(e, DirectoryChoiceError):  # the files to choose from, as the message lists them
+        error["candidates"] = [str(path) for path in e.candidates]
+    print(json.dumps({"error": error}))
     return 2
 
 
@@ -1447,6 +1773,17 @@ def refuse_pyodide_url(spec: str, how: str = "--offline") -> None:
     """--offline: a pyodide-lock.json URL would be downloaded, so ask for a local copy instead."""
     if "://" in spec:
         raise PyodideLockError(f"{how}: {spec} would be downloaded; save it and pass its path, or {undo_offline(how)}")
+
+
+def mark_pytorch_packages(source: Source, dockerfile: str, lines: dict[str, int]) -> None:
+    """Leave unknown rows out of both normal lookups and rechecks of locked files."""
+    for pkg in source.packages:
+        if pkg.skip or (line := lines.get(pkg.key)) is None:
+            continue
+        pkg.error = f"{dockerfile}:{line}: this package may come from {PYTORCH_INDEX}, an index wheelgap doesn't read"
+        pkg.files = None
+        pkg.registry = None
+        pkg.partial_files = False
 
 
 def unpinned_requirement_names(source: Source) -> list[str]:
@@ -1474,6 +1811,44 @@ def note_unpinned_requirements(sources: list[Source]) -> None:
             f"wheelgap: note: {source.label} has {len(names)} unpinned {noun} ({listed}), "
             "so the newest matching release was checked; pin them (uv pip compile, pip-compile) "
             "to check what you install",
+            file=sys.stderr,
+        )
+
+
+def note_prefer_binary(sources: list[Source]) -> None:
+    """A requirements file with --prefer-binary and an unpinned requirement: pip may take an older release that has a
+    wheel than the newest, which is the one checked. A pin isn't affected."""
+    for source in sources:
+        fc = source.format_control
+        if fc is not None and fc.prefer_binary and unpinned_requirement_names(source):
+            print(
+                f"wheelgap: note: {fc.prefer_binary} sets --prefer-binary: for an unpinned requirement pip may take "
+                "an older release that has a wheel, and wheelgap checked the newest",
+                file=sys.stderr,
+            )
+
+
+def _option_list(options: list[str]) -> str:
+    return options[0] if len(options) == 1 else f"{', '.join(options[:-1])} and {options[-1]}"
+
+
+def note_index_options(sources: list[Source]) -> None:
+    """One note per requirements file that sets an index option pip reads and wheelgap doesn't (Source.index_options):
+    by the option's name only, since its value may hold credentials. Another -r file of the same pip install line
+    that sets one gets a note for this file too, naming the file that sets it."""
+    for source in sources:
+        for setter, options in source.line_index_options:
+            print(
+                f"wheelgap: note: {setter} sets {_option_list(options)} for the install that reads {source.label} "
+                f"too, which wheelgap doesn't read: {source.label}'s packages were checked on PyPI only, so a package "
+                "pip finds elsewhere may install differently",
+                file=sys.stderr,
+            )
+        if not source.index_options:
+            continue
+        print(
+            f"wheelgap: note: {source.label} sets {_option_list(source.index_options)}, which wheelgap doesn't read: "
+            "its packages were checked on PyPI only, so a package pip finds elsewhere may install differently",
             file=sys.stderr,
         )
 
@@ -1580,18 +1955,38 @@ def version_suggestions(
     """--suggest: look the pinned gap packages' releases up on PyPI, one request per name, and return what to move to,
     by id() of the package. Only names that are positively PyPI's are looked up, by the rule --conda-forge follows
     (origin.known_pypi), and nothing in a run that uses another index; notes on stderr say which weren't, and why."""
+    return release_lookups(gaps, targets, sources, index_url, quiet)[0]
+
+
+PRIVATE_WHY = "wheelgap can't tell they come from PyPI, so their names stay private (see how-it-works.md#pypi-origin)"
+
+
+def release_lookups(
+    gaps: list[Row],
+    targets: list[Target],
+    sources: list[Source],
+    index_url: str | None,
+    quiet: bool,
+    flag: str = "--suggest",
+) -> tuple[Suggestions, dict[int, str]]:
+    """version_suggestions' lookups, for --suggest and --fix (`flag`, which the notes name), plus why the releases of
+    the other pinned gap packages weren't looked up (or couldn't be), by id() of the package. For --fix, the notes on
+    stderr about another index and about names kept private are left out: its own section says so, in one line."""
     other = origin.other_index(index_url)
+    notes = flag == "--suggest"
     if other is not None:
-        if not quiet:
+        if notes and not quiet:
             print(
                 f"wheelgap: note: --suggest looks nothing up when packages come from another index ({other})",
                 file=sys.stderr,
             )
-        return {}
+        why = f"packages may come from another index ({other}), so no names went to pypi.org"
+        return {}, {id(r.package): why for r in gaps if r.package.version and not r.package.no_binary}
     elsewhere = origin.private_names(sources, simple_index=index_url)
     source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
     asked: dict[str, list[Row]] = {}  # by canonical name: one lookup per package, however many rows it has
     kept_in: dict[str, str] = {}
+    skipped: dict[int, str] = {}
     for r in gaps:
         # Under --no-binary, pip uses no release's wheels, so a newer one with wheels wouldn't close the gap.
         if r.package.version and not r.package.no_binary and gap_targets(r, targets):
@@ -1599,7 +1994,10 @@ def version_suggestions(
                 asked.setdefault(r.package.key, []).append(r)
             else:
                 kept_in.setdefault(r.package.key, r.package.name)
-    if kept_in and not quiet:
+                skipped[id(r.package)] = PRIVATE_WHY
+        elif not r.package.version:
+            skipped[id(r.package)] = "they have no pinned version"
+    if kept_in and notes and not quiet:
         private = list(kept_in.values())
         print(
             f"wheelgap: note: --suggest didn't look up {len(private)} package{'s' * (len(private) != 1)} "
@@ -1620,13 +2018,33 @@ def version_suggestions(
         n = len(failed)
         which = _names([f"{asked[key][0].package.name} ({why})" for key, why in failed.items()])
         print(
-            f"wheelgap: note: --suggest couldn't look up {n} package{'s' * (n != 1)}: {which}; "
+            f"wheelgap: note: {flag} couldn't look up {n} package{'s' * (n != 1)}: {which}; "
             "no suggestion doesn't mean no newer release has wheels",
             file=sys.stderr,
         )
-    return {
+    for key, why in failed.items():
+        for r in asked[key]:
+            skipped[id(r.package)] = f"the lookup failed ({why})"
+    suggestions = {
         id(r.package): s for key, rows in asked.items() if key in found for r, s in zip(rows, found[key], strict=True)
     }
+    return suggestions, skipped
+
+
+FIX_HINT = (
+    "Run with --fix for a way out: an upgrade where a newer release has the wheel, else wheelgap's gap wheel index."
+)
+
+
+def gap_wheel_candidates(
+    gaps: list[Row], targets: list[Target], sources: list[Source], index_url: str | None
+) -> tuple[list[Row], list[Row], dict[int, Source], frozenset[str]]:
+    """Rows that could use a gap wheel, without reading the gap wheel list."""
+    private = origin.private_names(sources, simple_index=index_url)
+    source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
+    candidates = [r for r in gaps if gapwheels.candidates(r, targets)]
+    wanted = [r for r in candidates if gapwheels.eligible(r, source_of[id(r.package)], index_url, private)]
+    return candidates, wanted, source_of, private
 
 
 def gap_wheel_fills(
@@ -1642,7 +2060,10 @@ def gap_wheel_fills(
 ) -> list[gapwheels.Fill]:
     """--fix: the gap cells a wheel on wheelgap's gap wheel index fills. The list is read in one request that names no
     package, only when a gap of a package that is positively PyPI's could use it (gapwheels.eligible), and never when
-    packages come from another index. Notes on stderr say when it wasn't read, couldn't be, or nothing fits."""
+    packages come from another index. A cached list (cache.GAP_WHEELS_MAX_AGE) answers when it fills at least one of
+    this run's gaps, or when it fills none and was saved less than cache.GAP_WHEELS_RECHECK_AGE ago; otherwise the list
+    is fetched once more before saying none fits, since new wheels are published most days. Notes on stderr say when
+    it wasn't read, couldn't be (or couldn't be refreshed), or that nothing on the list fetched at a given time fits."""
     other = origin.other_index(index_url)
     if other is not None:
         if not quiet:
@@ -1653,10 +2074,7 @@ def gap_wheel_fills(
                 file=sys.stderr,
             )
         return []
-    private = origin.private_names(sources, simple_index=index_url)
-    source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
-    candidates = [r for r in gaps if gapwheels.candidates(r, targets)]
-    wanted = [r for r in candidates if gapwheels.eligible(r, source_of[id(r.package)], index_url, private)]
+    candidates, wanted, source_of, private = gap_wheel_candidates(gaps, targets, sources, index_url)
     # Only those the origin rule turned away: a --no-binary package wouldn't use a wheel anyway.
     unchecked = [
         r.package.name
@@ -1673,14 +2091,45 @@ def gap_wheel_fills(
         )
     fills: list[gapwheels.Fill] = []
     if wanted:
-        wheels = gapwheels.look_up(read_cache=read_cache, write_cache=write_cache)
-        if wheels is None:
+        cached_wheels: list[gapwheels.GapWheel] | None = None
+        saved_time: float | None = None
+        if read_cache:
+            cached_wheels, saved_time = gapwheels.look_up_cached()
+            if cached_wheels is not None:
+                fills = gapwheels.fillable(wanted, targets, source_of, cached_wheels, private, index_url)
+                if fills:
+                    return fills
+                if saved_time is not None and cache._now() - saved_time < cache.GAP_WHEELS_RECHECK_AGE:
+                    if not quiet:
+                        time_str = datetime.datetime.fromtimestamp(saved_time, datetime.UTC).strftime("%H:%M UTC")
+                        print(
+                            f"wheelgap: note: --fix: no wheel on the gap wheel list fetched at {time_str} "
+                            "fills these gaps",
+                            file=sys.stderr,
+                        )
+                    return []
+        live_wheels = gapwheels.fetch(write_cache=write_cache)
+        if live_wheels is None:
+            if cached_wheels is not None and saved_time is not None:
+                # Even with -q, like the note below: the index may have a wheel this older list lacks, and without
+                # the note a run that couldn't ask it would read as "no gap wheel fits".
+                time_str = datetime.datetime.fromtimestamp(saved_time, datetime.UTC).strftime("%H:%M UTC")
+                print(
+                    f"wheelgap: note: --fix: no wheel on the gap wheel list fetched at {time_str} "
+                    "fills these gaps; the list couldn't be refreshed",
+                    file=sys.stderr,
+                )
+                return []
             # Even with -q: without it, a run that couldn't look would read as "no gap wheel fits".
-            print("wheelgap: note: couldn't read the gap wheel list, so --fix has no suggestions", file=sys.stderr)
+            print("wheelgap: note: couldn't read the gap wheel list, so --fix suggests no gap wheels", file=sys.stderr)
             return []
-        fills = gapwheels.fillable(wanted, targets, source_of, wheels, private, index_url)
+        fills = gapwheels.fillable(wanted, targets, source_of, live_wheels, private, index_url)
         if not fills and not quiet:
-            print("wheelgap: note: --fix: no wheel on the gap wheel index fills these gaps", file=sys.stderr)
+            time_str = datetime.datetime.fromtimestamp(cache._now(), datetime.UTC).strftime("%H:%M UTC")
+            print(
+                f"wheelgap: note: --fix: no wheel on the gap wheel list fetched at {time_str} fills these gaps",
+                file=sys.stderr,
+            )
     return fills
 
 
@@ -1835,6 +2284,15 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         parser.error("--notes only adds to --explain; pass --explain too")
     if args.dist and args.inputs:
         parser.error("--dist DIR takes no other inputs")
+    if args.dockerfile_context is not None:
+        if not args.dockerfile_inputs:
+            parser.error("--dockerfile-context is only used with --dockerfile-inputs; pass --dockerfile-inputs too")
+        # An empty DIR (an unset variable in a script) must not quietly fall back to the Dockerfile's folder, where
+        # a different requirements.txt may sit, and Path("") would be the current folder.
+        if not args.dockerfile_context:
+            parser.error("--dockerfile-context: DIR is empty; pass the build context's folder (. for this one)")
+        if not Path(args.dockerfile_context).is_dir():
+            parser.error(f"--dockerfile-context: not a directory: {args.dockerfile_context}")
     if args.dockerfile_inputs:
         if not args.dockerfile:
             parser.error("--dockerfile-inputs reads what --dockerfile installs; pass --dockerfile too")
@@ -1847,11 +2305,87 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 f"so it can't be used with {', '.join(given)}"
             )
     installs: list[tuple[int, Path]] = []
-    # Where [tool.wheelgap] and .python-version are looked for: the Dockerfile's folder when it supplies the inputs.
-    config_inputs = [str(Path(args.dockerfile).parent)] if args.dockerfile_inputs else args.inputs
+    # Where [tool.wheelgap] and .python-version are looked for: the Dockerfile's folder (or --dockerfile-context DIR)
+    # when it supplies the inputs.
+    if args.dockerfile_inputs:
+        context_dir = Path(args.dockerfile_context) if args.dockerfile_context else Path(args.dockerfile).parent
+        config_inputs = [str(context_dir)]
+    else:
+        config_inputs = args.inputs
+    docker_includes: dict[tuple[int, Path], tuple[Path, ...]] = {}
+    docker_constraints: dict[Path, tuple[Path, ...]] = {}
+    docker_line_files: dict[Path, tuple[Path, ...]] = {}  # each file's -r files of its pip install line, in order
+    uv_installs: set[tuple[int, Path]] = set()
+    # (line, lock) -> (its --no-dev, its pyproject.toml, its .python-version pin or None, that file or None)
+    uv_syncs: dict[tuple[int, Path], tuple[bool, Path, str | None, Path | None]] = {}
+    image: ImageTarget | None = None
+    unknown_image: UnknownImageError | None = None
+    # What the Dockerfile answer leaves out, for --json's dockerfile_notes: {"dockerfile", "line", "kind", "message"}.
+    dockerfile_notes: list[dict[str, object]] = []
+    inputs_report = InputsReport()
+    dockerfile_warnings: list[dict[str, object]] = []
+    unseen_line = ""  # the stdout line for commands that may install packages wheelgap can't see
+    uv_named: set[int] = set()  # the id()s of the sources `uv pip install NAME` lines give
+    not_covered: list[str] = []  # what the headline says a --dockerfile-inputs answer doesn't cover
+
+    def read_image() -> None:
+        """The image of --dockerfile. One wheelgap can't read is an error, unless -p and -t say what to check."""
+        nonlocal image, unknown_image
+        path = Path(args.dockerfile)
+        # Not path.exists(): from Python 3.14 it is False for any OSError, and a permission error keeps its own message.
+        try:
+            path.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            raise DockerfileError(f"--dockerfile {args.dockerfile}: no such file") from None
+        if path.is_dir():
+            clean = args.dockerfile.rstrip("/\\")
+            example = f"{clean}/Dockerfile" if clean else "/Dockerfile"
+            raise DockerfileError(
+                f"--dockerfile {args.dockerfile}: is a folder; pass the Dockerfile in it, e.g. {example}"
+            )
+        try:
+            image = read_dockerfile(path, build_args)
+        except HeredocSyntaxError as e:
+            if args.dockerfile_inputs:
+                # -p and -t don't help --dockerfile-inputs here: say what does, with the line.
+                raise DockerfileError(f"{args.dockerfile}:{e.line}: {e.for_inputs()}") from None
+            if not (args.python and args.target):
+                raise
+            unknown_image = e
+        except UnknownImageError as e:
+            if not (args.python and args.target):
+                raise
+            unknown_image = e
+
     try:
         if args.dockerfile_inputs:
-            installs = dockerfile_requirements(Path(args.dockerfile), build_args)
+            # Before the RUN lines are read: an image that needs -p/-t is the first thing to say, not the last.
+            read_image()
+            context = Path(args.dockerfile_context) if args.dockerfile_context else None
+            # The Pythons the check is for, which a `python3.11 -m pip` or a venv's Python must be.
+            try:
+                docker_pythons = [
+                    f"{major}.{minor}{'t' * threaded}"
+                    for item in args.python
+                    for value in item.split(",")
+                    if value.strip()
+                    for major, minor, threaded in [parse_python(value)]
+                ]
+            except TargetError:
+                docker_pythons = []  # reported when the targets are built
+            installs = dockerfile_requirements(
+                Path(args.dockerfile),
+                build_args,
+                context=context,
+                includes=docker_includes,
+                constraints=docker_constraints,
+                line_files=docker_line_files,
+                dependencies=args.deps,
+                uv_installs=uv_installs,
+                uv_syncs=uv_syncs,
+                report=inputs_report,
+                pythons=docker_pythons or ([image.python] if image is not None else None),
+            )
             args.inputs = [str(requirements) for _, requirements in installs]
         if args.clear_cache:
             folder, count = cache.clear()
@@ -1878,30 +2412,131 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         docker_musl = False
         if args.dockerfile:
             # The image beats pyproject.toml; flags still win.
-            image = read_dockerfile(Path(args.dockerfile), build_args)
+            if not args.dockerfile_inputs:
+                read_image()
+            if unknown_image is not None:
+                # -p and -t are both given, so nothing is taken from the image. What that leaves unknown is said
+                # every time, --quiet or not: the answer is for the targets given, not for an image wheelgap read.
+                libc = "" if args.glibc or args.musl else " (pass --glibc or --musl if it isn't wheelgap's default)"
+                if isinstance(unknown_image, HeredocSyntaxError):
+                    reason = unknown_image.reason
+                else:
+                    reason = (
+                        str(unknown_image).removeprefix(f"{args.dockerfile}: ").removesuffix(", pass -p/-t instead")
+                    )
+                message = (
+                    f"the final image isn't read ({reason}), so this run checks the -p and -t given. Not known from "
+                    "the Dockerfile: which Python the image's pip installs for and which pip version it has, its "
+                    f"glibc or musl version{libc}, the packages the image already has, its own pip settings "
+                    "(ENV PIP_..., a pip.conf, a constraints file) and any ONBUILD instructions it runs in this build"
+                )
+                where = args.dockerfile if unknown_image.line is None else f"{args.dockerfile}:{unknown_image.line}"
+                print(f"wheelgap: note: {where}: {message}", file=sys.stderr)
+                dockerfile_notes.append(
+                    {
+                        "dockerfile": args.dockerfile,
+                        "line": unknown_image.line,
+                        "kind": "image-not-read",
+                        "message": message,
+                    }
+                )
+            if args.dockerfile_inputs:
+                notes, dockerfile_warnings, unseen_line = dockerfile_report_notes(args.dockerfile, inputs_report)
+                not_covered = dockerfile_qualifiers(dockerfile_warnings, unknown_image is not None)
+                # A warning is part of the answer, so --quiet keeps it; the notes say what was passed over.
+                for entry in dockerfile_warnings:
+                    print(f"wheelgap: warning: {args.dockerfile}:{entry['line']}: {entry['message']}", file=sys.stderr)
+                for entry in notes if not quiet else ():
+                    at = args.dockerfile if entry["line"] is None else f"{args.dockerfile}:{entry['line']}"
+                    print(f"wheelgap: note: {at}: {entry['message']}", file=sys.stderr)
+                dockerfile_notes += notes
             if not quiet:
                 for install_line, requirements in installs:
+                    if (install_line, requirements) in uv_syncs:
+                        _, pyproject, _, pin_file = uv_syncs[install_line, requirements]
+                        read = f"{requirements}, {pyproject}" + (f", {pin_file}" if pin_file is not None else "")
+                        print(
+                            f"wheelgap: note: {args.dockerfile}:{install_line}: RUN uv sync reads {read}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    # Every file read: the requirements file and what it includes, then each -c file of the line
+                    # and what that includes (a -r in a constraints file is requirements, a -c more constraints).
+                    files = ", ".join(
+                        str(file) for file in (requirements, *docker_includes[install_line, requirements])
+                    )
+                    for constraint in docker_constraints.get(requirements, ()):
+                        files += f", -c {constraint}"
+                        if nested := docker_includes[install_line, constraint]:
+                            files += f" (which includes {', '.join(str(file) for file in nested)})"
+                    installer = "uv pip" if (install_line, requirements) in uv_installs else "pip"
                     print(
-                        f"wheelgap: note: {args.dockerfile}:{install_line}: RUN pip install -r reads {requirements}",
+                        f"wheelgap: note: {args.dockerfile}:{install_line}: RUN {installer} install -r reads {files}",
                         file=sys.stderr,
                     )
-                for name, value in image.build_args:
-                    if name in image.given_args:
+                for name, value in image.build_args if image else ():
+                    if image and name in image.given_args:
                         note = f"FROM uses --build-arg {name}={value}"
                     else:
                         note = f"FROM uses the default of ARG {name}={value}; pass --build-arg if the build sets one"
                     print(f"wheelgap: note: {args.dockerfile}: {note}", file=sys.stderr)
-                for name in image.undeclared_args:
+                for name in image.undeclared_args if image else ():
                     print(
                         f"wheelgap: note: {args.dockerfile}: no ARG {name} before the first FROM, so "
                         f"--build-arg {name} doesn't change the image (Docker ignores it there too)",
                         file=sys.stderr,
                     )
-            docker_musl = image.platform.startswith("musl-")
-            if docker_musl and args.target:
-                args.target = [musl_docker_names(item) for item in args.target]
-            config.update(python=[image.python], targets=[image.platform])
-            config.update({k: v for k, v in (("glibc", image.glibc), ("musl", image.musl)) if v})
+                if image is not None and image.python_patch and not args.python:
+                    # The check is for X.Y at its newest patch release (see docs/how-it-works.md), which an image
+                    # pinned to an earlier one isn't. -p on the command line means the image's Python isn't used.
+                    print(
+                        f"wheelgap: note: {args.dockerfile}: {image.image} pins Python {image.python_patch}; "
+                        f"wheelgap checks {image.python} at its newest patch release, so a package that needs a "
+                        f"later {image.python} patch isn't flagged",
+                        file=sys.stderr,
+                    )
+            if image is not None:
+                docker_musl = image.platform.startswith("musl-")
+                if docker_musl and args.target:
+                    args.target = [musl_docker_names(item) for item in args.target]
+                config.update(python=[image.python], targets=[image.platform])
+                config.update({k: v for k, v in (("glibc", image.glibc), ("musl", image.musl)) if v})
+        # A `uv sync` line's copied .python-version picks the Python its lock installs for: that Python must be
+        # checked, as a venv's must be, and the answer can't split Pythons between the sync and other installs.
+        sync_pin = next((v for v in uv_syncs.values() if v[2] is not None), None)
+        if sync_pin is not None:
+            sync_line = next(line for (line, _), v in uv_syncs.items() if v is sync_pin)
+            pin_full = sync_pin[2]
+            assert pin_full is not None
+            m = re.fullmatch(r"(\d+\.\d+)(\.\d+)?(t?)", pin_full)
+            assert m is not None  # dockerfile.py only records a pin in this shape
+            pin_short, pin_patch = m[1] + m[3], m[2]
+            if args.python:
+                if pin_short not in docker_pythons:
+                    raise DockerfileError(
+                        f"{args.dockerfile}:{sync_line}: `uv sync` installs Python {pin_full} (its "
+                        f".python-version), which the check's Python ({', '.join(docker_pythons)}) doesn't "
+                        f"cover: check {pin_short} instead"
+                    )
+            else:
+                if image is not None and pin_short != image.python:
+                    others = [line for line, requirements in installs if (line, requirements) not in uv_syncs]
+                    others += [line for line, *_ in inputs_report.named]
+                    if others:
+                        raise DockerfileError(
+                            f"{args.dockerfile}:{sync_line}: `uv sync` installs Python {pin_short} (its "
+                            f".python-version), but the install on line {min(others)} installs the image's "
+                            f"{image.python}: --dockerfile-inputs checks one Python, and can't answer for both"
+                        )
+                config["python"] = [pin_short]
+            if pin_patch:
+                # As for an image's patch pin: the check is for X.Y at its newest patch release.
+                print(
+                    f"wheelgap: note: {args.dockerfile}:{sync_line}: .python-version pins Python {sync_pin[2]}; "
+                    f"wheelgap checks {pin_short} at its newest patch release, so a package that needs a later "
+                    f"{pin_short} patch isn't flagged",
+                    file=sys.stderr,
+                )
         glibc_version, musl_version = libc_versions(args, config)
         pythons = (
             args.python
@@ -1919,6 +2554,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 if any(p.startswith("musl-") for p in platforms):
                     note += "; Linux markers select both glibc and musl targets"
                 print(note, file=sys.stderr)
+        default_platforms = not platforms
         targets = build_targets(
             pythons,
             platforms,
@@ -1928,6 +2564,23 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             args.ios or config.get("ios", DEFAULT_IOS),
             args.android_api or config.get("android-api", DEFAULT_ANDROID_API),
         )
+        if unknown_image is not None and (image_tag := unknown_image.image) and re.search(r"alpine|musl", image_tag):
+            if glibc_targets := [t.platform for t in targets if t.platform.startswith("linux-")]:
+                # The tag isn't read, but it says musl: glibc targets are likely not what the image installs for.
+                message = (
+                    f"{image_tag} looks like an Alpine (musl) image, and glibc targets are checked "
+                    f"({', '.join(dict.fromkeys(glibc_targets))}): pass -t musl-... if the image uses musl"
+                )
+                where = args.dockerfile if unknown_image.line is None else f"{args.dockerfile}:{unknown_image.line}"
+                print(f"wheelgap: note: {where}: {message}", file=sys.stderr)
+                dockerfile_notes.append(
+                    {
+                        "dockerfile": args.dockerfile,
+                        "line": unknown_image.line,
+                        "kind": "image-libc",
+                        "message": message,
+                    }
+                )
         if not quiet and (resolved := next_python_note(pythons)):
             print(f"wheelgap: note: {resolved}", file=sys.stderr)
         ignore_how = "--ignore" if args.ignore else "ignore in [tool.wheelgap]"
@@ -1973,14 +2626,85 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         else:
             check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
         if args.from_log is not None:
-            failures = failed_builds(read_log(args.from_log), other_index=origin.other_index(index_url) is not None)
-            listed = ", ".join(f"{name} {version}" for name, version in failures)
+            log_text = read_log(args.from_log)
+            failures = failed_builds(log_text, other_index=origin.other_index(index_url) is not None)
+            on_pypy = ran_on_pypy(log_text)
+            if on_pypy:
+                print(
+                    "wheelgap: note: the install log's build ran on PyPy, and wheelgap checks CPython wheels "
+                    "only: the answers are for CPython and don't say why the build failed there (PyPy wheels "
+                    "carry pp tags, such as pp311, not cp ones)",
+                    file=sys.stderr,
+                )
+            listed = ", ".join(
+                f"{name} {version}" if version else f"{name} (the log doesn't name the version)"
+                for name, version in failures
+            )
             print(f"wheelgap: note: the install log says these failed to build: {listed}", file=sys.stderr)
             sources = [log_source(failures)]
         else:
-            sources = (
-                [parse_dist(Path(args.dist))] if args.dist else load_inputs(args.inputs or ["."], args.environment)
-            )
+            if args.dist:
+                sources = [parse_dist(Path(args.dist))]
+            elif args.dockerfile_inputs:
+                # The requirements files the install lines read, then the requirements they name: one source per
+                # RUN line, labelled with it, checked as names on wheelgap's own command line are.
+                # pip reads a `pip install -r FILE` file as requirements whatever its name, except a PEP 751 lock
+                # name (pylock.toml, pylock.NAME.toml), which pip 26.1 and later install as that lock; a uv line's
+                # file keeps the reader its name picks, and a `uv sync` line's lock is read as uv.lock whatever its
+                # context name (in the image it is uv.lock, which is what uv sync looks for).
+                docker_kinds = {
+                    req: "uv"
+                    if (line, req) in uv_syncs
+                    else "pylock"
+                    if _PIP_PYLOCK_NAME_RE.fullmatch(req.name)
+                    else "requirements"
+                    for line, req in installs
+                    if (line, req) not in uv_installs
+                }
+                sources = (
+                    load_inputs(
+                        args.inputs,
+                        args.environment,
+                        requirements_constraints=docker_constraints,
+                        file_kinds=docker_kinds,
+                        requirements_line_files=docker_line_files,
+                    )
+                    if args.inputs
+                    else []
+                )
+                for source in sources:
+                    if source.path is not None and (pytorch := inputs_report.pytorch_files.get(source.path)):
+                        mark_pytorch_packages(source, args.dockerfile, pytorch)
+                for (named_line, named_texts, by_uv), line_files in zip(
+                    inputs_report.named, inputs_report.named_files, strict=True
+                ):
+                    named_label = f"{args.dockerfile}:{named_line}"
+                    if line_files:  # the line's -r files set options for the names too, as pip reads them
+                        named = parse_named_requirements(named_label, named_texts, line_files)
+                    else:
+                        named = Source(named_label, pypi_only=True)
+                        for text in named_texts:
+                            named.packages.append(requirement_to_package(text, named.label))
+                            named.specs.append(text)
+                    if pytorch := inputs_report.pytorch_named.get(named_line):
+                        mark_pytorch_packages(named, args.dockerfile, pytorch)
+                    sources.append(named)
+                    if by_uv:
+                        uv_named.add(id(named))
+                    loose = unpinned_requirement_names(named)
+                    if loose and not quiet:
+                        noun = "package" if len(loose) == 1 else "packages"
+                        listed = ", ".join(loose[:2]) + (", …" if len(loose) > 2 else "")
+                        print(
+                            f"wheelgap: note: {named.label}: RUN pip install names {len(loose)} unpinned {noun} "
+                            f"({listed}), so the newest matching release was checked; pin them to check what "
+                            "you install",
+                            file=sys.stderr,
+                        )
+            else:
+                sources = load_inputs(
+                    args.inputs or ["."], args.environment, requirements_constraints=docker_constraints
+                )
         if args.print_gap_wheel_snippet and (
             len(sources) != 1
             or sources[0].kind not in gapwheels.SNIPPET_KINDS
@@ -1992,8 +2716,36 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 "uv.lock (not a script's), one requirements file or package names on the command line "
                 "(--fix alone covers the others)"
             )
+        if default_platforms:
+            # Nobody asked for these platforms, so a uv.lock made with [tool.uv] environments is checked on the
+            # default platforms it was locked for. One it covers for some of the Pythons only stays, and is an
+            # error below, as a platform that was asked for is.
+            targets, left_out = narrow_to_lock_environments(sources, targets)
+            if left_out and not quiet:
+                note = lock_environments_note(sources, left_out, targets, "default targets")
+                print(f"wheelgap: note: {note}", file=sys.stderr)
+            advisory = frozenset(t for t in advisory if t in targets)
+        elif advisory:
+            # An advisory target never fails the run, so one the lock leaves out isn't checked either: with a note,
+            # as for the defaults, rather than an error.
+            unlocked = {t for source in sources for t in lock_environment_targets(source, advisory)[0]}
+            if unlocked and len(unlocked) < len(targets):
+                if not quiet:
+                    print(
+                        f"wheelgap: note: {', '.join(s.label for s in sources if s.supported_markers)} is locked for "
+                        "`[tool.uv] environments` only, which leave out the advisory targets "
+                        f"{', '.join(t.label(len({t.python for t in targets}) > 1) for t in targets if t in unlocked)}"
+                        ": not checking them",
+                        file=sys.stderr,
+                    )
+                targets = [t for t in targets if t not in unlocked]
+                advisory = advisory - unlocked
         for source in sources:
             check_report_targets(source, targets)
+            if source.found is not None:
+                for line in directory_notes(source.found):  # always: the file read isn't the one the name promises
+                    print(f"wheelgap: note: {line}", file=sys.stderr)
+            check_lock_environments(source, targets)
             if source.passed_over is not None and not quiet:
                 print(
                     f"wheelgap: note: {source.path} was checked; {source.passed_over} is in the same folder too "
@@ -2031,10 +2783,11 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     if args.extra or args.all_extras:
                         raise SourceError(f"{source.label}: no [project] optional-dependencies to select from")
                     if not (args.group or args.only_group):
-                        if source.pyproject_groups:
-                            names = ", ".join(sorted(source.pyproject_groups))
+                        group_names = pyproject_group_names(source.pyproject_groups)
+                        if group_names:
                             raise SourceError(
-                                f"{source.label}: no [project] table; pick one with --group or --only-group: {names}"
+                                f"{source.label}: no [project] table; pick one with --group or --only-group: "
+                                f"{', '.join(group_names)}"
                             )
                         raise SourceError(f"{source.label}: no [project] table and no groups to select")
                 if args.only_group and (args.extra or args.all_extras):
@@ -2043,6 +2796,19 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     )
                 select_pyproject_groups(source, args.group or [], args.only_group or [])
                 select_pyproject_extras(source, args.extra or [], args.all_extras)
+        # A `uv sync` line's own flags are its lock's selection, applied below even with no selectors of
+        # wheelgap's own: `wheelgap uv.lock` with no flags checks all groups and extras, but a sync without them
+        # installs the defaults (and dev only without --no-dev). The line is what the image installs, so wheelgap's
+        # own selectors don't apply to its lock: on the command line they are an error (as they are for a -r file
+        # of the Dockerfile), and configured ones ([tool.wheelgap] extras and groups) leave it as the line says.
+        sync_locks = {requirements: line for line, requirements in installs if (line, requirements) in uv_syncs}
+        if sync_locks and (from_cli or args.only_group):
+            sync_line = min(sync_locks.values())
+            raise SourceError(
+                "--extra, --all-extras, --group, --only-group and --no-dev don't apply to --dockerfile-inputs: "
+                f"`uv sync` on {args.dockerfile}:{sync_line} picks what the image installs"
+            )
+        lock_sources = [s for s in lock_sources if s.path not in sync_locks]
         if (from_cli or args.only_group or extra_names is not None or group_names is not None) and (
             lock_sources or not pyproject_sources
         ):
@@ -2062,6 +2828,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 poetry=bool(from_cli or args.only_group) or group_names is not None or extra_names is not None,
                 pdm=bool(from_cli or args.only_group) or group_names is not None,
             )
+        for source in sources:
+            if source.path in sync_locks and source.pyproject_extras is None:
+                no_dev, _, _, _ = uv_syncs[sync_locks[source.path], source.path]
+                select_uv_dependencies([source], UvSelection(no_dev=no_dev), strict=False)
         if args.deps:
             dependency_sources = [s for s in sources if s.specs or s.pyproject_extras is not None]
             if not dependency_sources:
@@ -2080,9 +2850,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     "index-url in [tool.wheelgap]) doesn't have"
                 )
             for source in dependency_sources:
-                # A command-line name is PyPI's by definition; a file may point pip elsewhere, where --deps
-                # can't see, so it refuses rather than answer for the wrong index.
-                if not (source.requirements or source.pyproject_extras is not None):
+                # A command-line name is PyPI's by definition, unless the -r files of its Dockerfile install line
+                # set an index option; a file may point pip elsewhere, where --deps can't see, so it refuses rather
+                # than answer for the wrong index.
+                if not (source.requirements or source.pyproject_extras is not None or not source.pypi_only):
                     continue
                 instead = (
                     ", so check its lock (uv lock --script) instead"
@@ -2195,13 +2966,24 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             )
     if not quiet:
         note_unpinned_requirements(sources)
+        note_prefer_binary(sources)
+        if origin.other_index(index_url) is None:  # with --index-url or a mirror, the run doesn't check PyPI only
+            note_index_options(sources)
         for source in sources:
             if source.poetry_extras_unsure is not None:
                 print(f"wheelgap: note: {source.label}: {source.poetry_extras_unsure}", file=sys.stderr)
+            for note in source.ignored_options:  # pip's answer either way, so -q drops it
+                print(f"wheelgap: note: {note}", file=sys.stderr)
     for source in sources:
         # Always, like the note below: either may mean uv applies another upload cutoff than the one checked.
         if source.exclude_newer_unread is not None:
             print(f"wheelgap: note: {source.label}: {source.exclude_newer_unread}", file=sys.stderr)
+        if source.exclude_newer_durations and not quiet:  # the answer is uv's either way, so -q drops it
+            print(
+                f"wheelgap: note: {source.label}: a duration counts back from the time of this run, as uv counts "
+                f"it back from the time it resolves: {', '.join(source.exclude_newer_durations)}",
+                file=sys.stderr,
+            )
         if source.pyproject_extras is not None and os.environ.get("UV_EXCLUDE_NEWER"):
             print(
                 f"wheelgap: note: {source.label}: UV_EXCLUDE_NEWER is set, which uv uses over the file's "
@@ -2259,10 +3041,11 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 )
     # --online asks the index again but saves the answer, so a plain run afterwards doesn't go back to an older one.
     cached = {"read_cache": not (args.no_cache or args.online), "write_cache": not args.no_cache}
+    pythons = tuple(dict.fromkeys(f"{t.major}.{t.minor}" for t in targets))
     other_index = fill_all(
         packages,
         refresh=args.online,
-        pythons=tuple(dict.fromkeys(f"{t.major}.{t.minor}" for t in targets)),
+        pythons=pythons,
         simple_index=index_url,
         read_cache=cached["read_cache"],
         write_cache=cached["write_cache"],
@@ -2301,6 +3084,19 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 note += f"; {' and '.join(unchecked)} may show false gaps for those Pythons"
             if unchecked or not quiet:  # quiet runs stay quiet unless the answer may be wrong
                 print(note, file=sys.stderr)
+    apply_locked_python_ranges(packages, pythons, online=args.online)
+    if args.online:
+        for source, needed in zip(sources, needed_by_source, strict=True):
+            if source.uv_packages is not None:
+                restore_uv_python_files(needed, pythons)
+    # --dockerfile-inputs: a requirements file that `RUN uv pip install` installs follows uv's rules, not pip's, as
+    # a uv.lock checked with --online does just above: uv checks only the lower bound of a file's Requires-Python,
+    # so it installs a pin pip refuses (uv 0.13.1 installs sktime==0.20.0, Requires-Python <3.12,>=3.8, on Python
+    # 3.13; pip finds no matching distribution). Every requirement in such a file is pinned (dockerfile_requirements).
+    uv_files = {requirements for line, requirements in installs if (line, requirements) in uv_installs}
+    for source, needed in zip(sources, needed_by_source, strict=True):
+        if source.path in uv_files or id(source) in uv_named:
+            restore_uv_python_files(needed, pythons)
     skipped = [p for p in packages if p.skip]
     rows = [r for r in check(sources, targets) if r.needed]
     if pyodide_lock:
@@ -2343,11 +3139,33 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     for r in rows:
         if r.package.key in ignore_on:
             r.ignored = frozenset(t for t in targets if t.platform in ignore_on[r.package.key])
+    # A uv.lock checked with --online (sources.restore_uv_python_files): the answer is uv's, and pip's differs.
+    pip_refusals = len({(r.package.key, r.package.version) for r in rows if r.package.pip_refuses})
+    if pip_refusals and not quiet:
+        what, it = ("package is", "it") if pip_refusals == 1 else ("packages are", "them")
+        print(
+            f"wheelgap: note: {pip_refusals} {what} checked as uv installs {it}, though pip would refuse {it}: "
+            "uv checks the Requires-Python lower bound (the text report's --explain says which, and --json lists "
+            "the files in pip_refuses)",
+            file=sys.stderr,
+        )
     gaps = [r for r in rows if not r.ok]
+    # --from-log: each failed package checked at its latest release, as the log names no version (also in --json and
+    # --markdown, so a report never shows that version as the log's).
+    from_log_notes: list[dict[str, str]] = []
     if args.from_log is not None:
         multi_py = len({t.python for t in targets}) > 1
+        unversioned = {canonicalize_name(name) for name, version in failures if version is None}
         for r in rows:
-            if fits := [t.label(multi_py) for t, status in r.results.items() if status == Status.WHEEL]:
+            if canonicalize_name(r.package.name) in unversioned and r.package.version:
+                message = LATEST_NOTE.format(name=r.package.name, version=r.package.version)
+                from_log_notes.append(
+                    {"name": r.package.name, "version": r.package.version, "kind": "latest", "message": message}
+                )
+                print(f"wheelgap: note: {message}", file=sys.stderr)
+            if not on_pypy and (
+                fits := [t.label(multi_py) for t, status in r.results.items() if status == Status.WHEEL]
+            ):
                 print(
                     f"wheelgap: note: the install log says {r.package.name} failed to build, but "
                     f"{r.package.name} {r.package.version} has a wheel for {', '.join(fits)}: the log likely "
@@ -2355,6 +3173,11 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     file=sys.stderr,
                 )
     source_labels = [s.label for s in sources]
+    install_sites = {path: f"{args.dockerfile}:{line}" for line, path in installs}
+    display_labels = [
+        f"{source.label} ({install_sites[source.path]})" if source.path in install_sites else source.label
+        for source in sources
+    ]
     row_notes: RowNotes = {}
     row_builds: RowBuilds = {}
     # Opt-in, since it sends package names to wheelgap.github.io: --explain on a lockfile makes no requests by default.
@@ -2397,7 +3220,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     conda_forge = conda_forge_hints(gaps, targets, sources, index_url, quiet, cached) if args.conda_forge else {}
     pi_wheels = piwheels_hints(gaps, targets, sources, index_url, quiet, cached) if args.piwheels else {}
     # None: not asked for. Like the hints above, it never changes a status or the exit code.
-    suggestions = version_suggestions(gaps, targets, sources, index_url, quiet) if args.suggest else None
+    suggestions: Suggestions | None = None
+    unlooked: dict[int, str] = {}  # --fix: why a pinned gap package's releases weren't looked up, by id() of it
+    if args.suggest:
+        suggestions, unlooked = release_lookups(gaps, targets, sources, index_url, quiet)
     # With --fail-on missing, source builds are accepted; missing and unknown packages still fail. Gaps on
     # --advisory targets never fail the run.
     fail_statuses = GAP_STATUSES if fail_on == "source" else (Status.MISSING, Status.UNKNOWN)
@@ -2486,6 +3312,29 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         if args.fix
         else None
     )
+    # --fix: each gap cell's way out, an upgrade first (the releases --suggest looks up, looked up once for both).
+    fix_cells: list[fix.Cell] | None = None
+    if args.fix:
+        upgrades = suggestions
+        if upgrades is None:
+            upgrades, unlooked = release_lookups(gaps, targets, sources, index_url, quiet, flag="--fix")
+        source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
+        fix_cells = fix.plan(gaps, targets, source_of, upgrades, fills or [], unlooked)
+    # The hint never makes a request: it reads only the list a --fix run left in the cache (kept for
+    # cache.GAP_WHEELS_MAX_AGE), and only when a gap could use it. No hint when that list fills nothing; that is
+    # silence, not "nothing fits": --fix itself fetches the list again before it says so (gap_wheel_fills).
+    fix_hint = None
+    if not (args.fix or args.json or quiet or offline) and origin.other_index(index_url) is None:
+        _, hint_rows, source_of, private = gap_wheel_candidates(gaps, targets, sources, index_url)
+        if hint_rows:
+            wheels = gapwheels.look_up_cached()[0] if cached["read_cache"] else None
+            if wheels is None:
+                fix_hint = FIX_HINT
+            elif count := len(gapwheels.fillable(hint_rows, targets, source_of, wheels, private, index_url)):
+                fix_hint = (
+                    "Run with --fix for a way out: an upgrade where a newer release has the wheel, else wheelgap's gap "
+                    f"wheel index, which has a wheel for {count} of these gaps."
+                )
 
     if args.print_gap_wheel_snippet:  # one input of gapwheels.SNIPPET_KINDS, checked when it was read
         multi_py = len({t.python for t in targets}) > 1
@@ -2494,17 +3343,34 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         return code
 
     issues_urls = explain_issues_urls(rows, sources, index_url) if args.explain else None
+    # --fix names the issue tracker of a gap with no fix; it's read from the lookups already made, never fetched.
+    fix_issues = (issues_urls or explain_issues_urls(gaps, sources, index_url)) if fix_cells else {}
 
     if args.junit is not None:  # an empty PATH (an unset CI variable) is an error, not "no report"
         try:
-            write_junit(args.junit, rows, targets, fail_on, advisory)
+            write_junit(
+                args.junit,
+                rows,
+                targets,
+                fail_on,
+                advisory,
+                [f"{file}:{line}: {message}" for _, file, line, message in dockerfile_results([], dockerfile_warnings)],
+            )
         except OSError as e:
             print(f"wheelgap: error: {e}", file=sys.stderr)
             return input_error_json(e) if args.json else 2
 
     if args.sarif is not None:  # an empty PATH is an error, as for --junit
         try:
-            write_sarif(args.sarif, rows, targets, sources, fail_on, advisory)
+            write_sarif(
+                args.sarif,
+                rows,
+                targets,
+                sources,
+                fail_on,
+                advisory,
+                dockerfile_results(dockerfile_notes, dockerfile_warnings),
+            )
         except OSError as e:
             print(f"wheelgap: error: {e}", file=sys.stderr)
             return input_error_json(e) if args.json else 2
@@ -2540,7 +3406,51 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     if args.github_annotations:
         # Workflow commands work on stdout and stderr alike; stderr keeps --json and --markdown output clean.
         # These are wheelgap's own (escaped in github.workflow_command), so they go past the logsafe guard.
-        for command in github_annotations(rows, targets, sources, failing, advisory):
+        installed_by = (
+            {
+                package_id: install_sites[source.path]
+                for package_id, source in source_of.items()
+                if source.path is not None and source.path in install_sites
+            }
+            if install_sites
+            else None
+        )
+        # For each file a RUN line reads through -r or -c, the file on the line it is reached from, relative to the
+        # build context as the header and --json name it: the requirements file, or the -c file whose -r brought it
+        # (the requirements file when both lead there).
+        tops: dict[Path, dict[Path, str]] = {}
+        for install_line, requirements in installs:
+            reached = tops.setdefault(requirements, {})
+            for on_line in (requirements, *docker_constraints.get(requirements, ())):
+                for include in docker_includes.get((install_line, on_line), ()):
+                    if include.resolve() != requirements.resolve():  # a -c file's -r back to the file on the line
+                        reached.setdefault(include.resolve(), on_line.relative_to(context_dir).as_posix())
+        installed_through = (
+            {
+                package_id: tops[source.path]
+                for package_id, source in source_of.items()
+                if source.path is not None and source.path in tops
+            }
+            if install_sites
+            else None
+        )
+        for command in github_annotations(
+            rows,
+            targets,
+            sources,
+            failing,
+            advisory,
+            fills,
+            installed_by=installed_by,
+            installed_through=installed_through,
+            fix_cells=fix_cells,
+        ):
+            write_command(command, sys.stderr if args.json or args.markdown else sys.stdout)
+        for level, file, at_line, message in dockerfile_results(dockerfile_notes, dockerfile_warnings):
+            at_path = relative_path(Path(file))
+            command = workflow_command(
+                "notice" if level == "note" else level, message, at_path, at_line if at_path else None, "wheelgap"
+            )
             write_command(command, sys.stderr if args.json or args.markdown else sys.stdout)
 
     if args.json:
@@ -2562,7 +3472,42 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 dropped,
                 issues_urls=issues_urls,
                 gap_wheels=fills,
+                fix_cells=fix_cells,
                 pi_wheels=pi_wheels,
+                # As the Dockerfile's COPY names it: relative to the build context, with /, whatever the OS, the
+                # working directory or the way the context was given.
+                dockerfile_inputs=[
+                    {
+                        "dockerfile": args.dockerfile,
+                        "line": line,
+                        "file": path.relative_to(context_dir).as_posix(),
+                        "constraints": [
+                            constraint_path.relative_to(context_dir).as_posix()
+                            for constraint_path in docker_constraints[path]
+                        ],
+                        "includes": [
+                            include_path.relative_to(context_dir).as_posix()
+                            for include_path in docker_includes[(line, path)]
+                        ],
+                    }
+                    for line, path in installs
+                ]
+                if args.dockerfile_inputs
+                else None,
+                dockerfile_notes=dockerfile_notes,
+                dockerfile_warnings=dockerfile_warnings if args.dockerfile_inputs else None,
+                dockerfile_packages=[
+                    {
+                        "dockerfile": args.dockerfile,
+                        "line": line,
+                        "installer": "uv pip" if by_uv else "pip",
+                        "requirements": requirements,
+                    }
+                    for line, requirements, by_uv in inputs_report.named
+                ],
+                image_unread=bool(args.dockerfile_inputs) and unknown_image is not None,
+                directory_inputs=directory_inputs_json(sources),
+                from_log_notes=from_log_notes if args.from_log is not None else None,
             )
         )
         return code
@@ -2575,7 +3520,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     *render_markdown(
                         rows,
                         targets,
-                        source_labels,
+                        display_labels,
                         skipped,
                         ignored,
                         args,
@@ -2590,15 +3535,29 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                         dropped=dropped,
                         issues_urls=issues_urls,
                         pi_wheels=pi_wheels,
+                        fix_hint=fix_hint,
+                        not_covered=not_covered,
                     ),
-                    *gapwheels.markdown_lines(fills or [], multi_py),
+                    *fix.markdown_lines(fix_cells or [], multi_py, unlooked, fix_issues),
+                    *gapwheels.markdown_lines(
+                        fills or [], multi_py, fix.alternatives(fix_cells or []), fix.any_upgrade(fix_cells or [])
+                    ),
+                    *(["", f"> **Warning:** {unseen_line}"] if unseen_line else []),
+                    *dockerfile_markdown(dockerfile_results(dockerfile_notes)),
+                    *(line for note in from_log_notes for line in ("", f"> **Note:** {note['message']}")),
                 ]
             )
         )
         return code
 
     style = Style(use_color(args.color))
-    fix_lines = gapwheels.text_lines(fills or [], multi_py)  # nothing unless a gap wheel fills a gap
+    # Nothing without --fix or without a gap: the summary, upgrades and gaps with no fix, then the gap wheels.
+    fix_lines = [
+        *fix.text_lines(fix_cells or [], multi_py, unlooked, fix_issues),
+        *gapwheels.text_lines(
+            fills or [], multi_py, fix.alternatives(fix_cells or []), fix.any_upgrade(fix_cells or [])
+        ),
+    ]
     total_pkgs = len(_group_rows(rows))
     if quiet:
         if gaps:
@@ -2626,11 +3585,13 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 print(f"wheelgap: could not check {r.package.name}: {r.package.error}", file=sys.stderr)
         for ln in fix_lines:  # asked for with --fix, so -q keeps it
             print(ln)
+        if unseen_line:
+            print(style.yellow(f"! {unseen_line}"))
         return code
 
     pys = ", ".join(dict.fromkeys(t.python for t in targets))
     n_pkgs = f"{total_pkgs} package{'s' * (total_pkgs != 1)}"
-    print(style.dim(f"wheelgap {__version__} · {' + '.join(source_labels)} · {n_pkgs} · Python {pys}"))
+    print(style.dim(f"wheelgap {__version__} · {' + '.join(display_labels)} · {n_pkgs} · Python {pys}"))
     print()
 
     shown = rows if args.all else gaps
@@ -2656,6 +3617,9 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 issues_urls=issues_urls,
                 published_wheels=fills,
                 pi_wheels=pi_wheels,
+                upgrades={
+                    (id(c.row), c.target): c.version for c in fix_cells or [] if c.kind == fix.UPGRADE and c.version
+                },
             ):
                 print(ln)
 
@@ -2678,10 +3642,30 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     if not rows:  # "All 0 packages have a wheel" reads like a success when the run checked nothing
         print(style.dim("No packages to check."))
         return 0
+    if args.explain and pip_refusals:
+        for r in rows:
+            if r.package.pip_refuses:
+                affected = ", ".join(
+                    target.label(multi_py) for target in targets if r.results[target] is not Status.NOT_NEEDED
+                )
+                # One line per reason, not per file: a release's files nearly always share one Requires-Python.
+                for why in dict.fromkeys(r.package.pip_refuses.values()):
+                    print(
+                        f"{r.package.name} {r.package.version} on {affected}: checked as uv installs it "
+                        f"(uv checks the Requires-Python lower bound); pip refuses it: {why}"
+                    )
+        print()
+
     if not gaps:
         what = "The 1 package has" if total_pkgs == 1 else f"All {total_pkgs} packages have"
         every = f"{'every one of ' if n_t > 1 else ''}{n_t} target{'s' * (n_t > 1)}{apart_from_ignored(rows)}"
-        print(style.green(f"✓ {what} a wheel for {every}."))
+        if not_covered:
+            # Not a green tick: the answer is for the install lines read, and some lines weren't seen into.
+            print(style.yellow(f"! {read_packages(total_pkgs)} a wheel for {every}; {'; '.join(not_covered)}."))
+            if unseen_line:
+                print(style.yellow(f"! {unseen_line}"))
+        else:
+            print(style.green(f"✓ {what} a wheel for {every}."))
         return code
 
     for line in target_lines(gaps, targets, style, advisory):
@@ -2696,10 +3680,14 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         print(style.dim(line))
     if not args.explain:
         print(style.dim("Run with --explain to see which wheels were rejected and why."))
+    if fix_hint:
+        print(style.dim(fix_hint))
     if source_allowed and not args.exit_zero:
         print(style.dim("Source builds are allowed (--fail-on missing), so this run passes."))
     for ln in fix_lines:  # a gap wheel fills only a gap, so the runs that return early above have none
         print(ln)
+    if unseen_line:
+        print(style.yellow(f"! {unseen_line}"))
     return code
 
 

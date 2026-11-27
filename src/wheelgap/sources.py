@@ -6,9 +6,11 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import tomllib
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from collections import deque
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -21,13 +23,14 @@ from packaging.utils import (
     InvalidSdistFilename,
     InvalidWheelFilename,
     canonicalize_name,
-    canonicalize_version,
     parse_sdist_filename,
     parse_wheel_filename,
 )
 from packaging.version import InvalidVersion, Version
 
-from .cutoff import parse_cutoff
+from . import cutoff as cutoffs
+from .cutoff import describe, is_duration, parse_cutoff
+from .targets import PLATFORMS
 
 if TYPE_CHECKING:
     from .targets import Target
@@ -66,6 +69,8 @@ class Package:
     markers: list[str] | None = None
     # A version range that isn't an exact pin (numpy>=1.26,<2): the index picks the newest match.
     spec: str | None = None
+    # `spec` with its clauses in the order the requirement writes them (packaging sorts them), for --fix to show.
+    written_spec: str | None = None
     # Files of a pinned release that the index marks as yanked (see check.status_for).
     yanked: frozenset[str] = frozenset()
     # uv.lock / pylock.toml / poetry.lock / Pipfile.lock: the index the lock says the package came from, e.g.
@@ -86,9 +91,30 @@ class Package:
     resolutions: dict[str, Package] = field(default_factory=dict)
     # Files of a pinned release whose Requires-Python excludes the target Python, mapped to their --explain reason.
     requires_python_rejected: dict[str, str] = field(default_factory=dict)
+    # The release's Requires-Python as the lock records it for the package (pylock.toml's requires-python,
+    # poetry.lock's python-versions, pdm.lock's requires_python), applied to the lock's own files per target Python
+    # (pypi.apply_locked_python_ranges). Only kept where the lock also records each package's markers (always in a
+    # pylock.toml; Poetry from lock-version 2.1; PDM with inherit_metadata). Poetry and PDM lock a package only for
+    # the Pythons its markers select, so there a range that leaves a target out says something only for a Python
+    # outside the project's own range. Without the markers the package would be reported `missing` on a Python the
+    # installer never installs it for (numpy = [{version = "1.26.4", python = "<3.13"}, ...] in pyproject.toml).
+    locked_requires_python: str | None = None
+    # Yanked status of Python-rejected files, needed when applying uv's upper-bound policy.
+    python_rejected_yanked: frozenset[str] = frozenset()
+    # Files admitted by uv that pip would refuse for this Python.
+    pip_refuses: dict[str, str] = field(default_factory=dict)
+    # sha256 hashes listed on the requirement line in a requirements file (--hash=sha256:... or --hash sha256:...).
+    # If not empty, only files whose sha256 matches one of these are accepted.
+    hashes: frozenset[str] = frozenset()
+    # Files of a pinned release whose sha256 hash was not listed in requirements, mapped to their --explain reason.
+    hash_rejected: dict[str, str] = field(default_factory=dict)
     # Distribution selection policy from requirements files or uv project configuration.
     no_binary: bool = False
     only_binary: bool = False
+    # A requirements file's release control for this package, as pip's ReleaseControl.allows_prereleases gives it
+    # (--pre, --all-releases, --only-final): True takes pre-releases, False never does (a pinned one is an error), and
+    # None is the default: a pre-release only when the range names one or nothing else matches.
+    prereleases: bool | None = None
     # The relevant uv setting(s), used to explain a gap caused by the configured policy.
     install_policy: str | None = None
     # PyPI project metadata URLs (project_urls and home_page).
@@ -136,6 +162,23 @@ class UvSelection:
 
 
 @dataclass
+class DirectoryInput:
+    """How a directory input (`wheelgap DIR`) came to the file that was read (load_directory)."""
+
+    directory: Path
+    path: Path
+    # Where the file was found: "lockfile" (one of LOCKFILES at the root, as always), "pyproject" (the root's
+    # pyproject.toml), "requirements" (the root's only requirements file under another name) or "subfolder" (the
+    # only input below the root).
+    reason: str
+    # Files that come first in the search but have nothing to check, each with why.
+    empty: list[tuple[Path, str]] = field(default_factory=list)
+    # "pyproject": the root's requirements files under other names, which weren't read, each with whether it looks
+    # like a compiler's full pin list (_looks_compiled_and_pinned). For the note and --json only, never to choose.
+    other_requirements: list[tuple[Path, bool]] = field(default_factory=list)
+
+
+@dataclass
 class Source:
     label: str
     packages: list[Package] = field(default_factory=list)
@@ -148,12 +191,20 @@ class Source:
     root_groups: dict[int, str] = field(default_factory=dict)
     # uv.lock only: the project's requires-python. uv keeps only the wheels that can serve it.
     requires_python: str | None = None
+    # uv.lock only: its supported-markers, the project's [tool.uv] environments. When there are any, uv locked
+    # for those environments only: `uv sync` fails anywhere else, and the lock leaves out the packages and wheels
+    # that only other environments need (see check.check_lock_environments).
+    supported_markers: list[str] = field(default_factory=list)
     # Scripts and pyproject.toml: uv's exclude-newer (#521). A file uploaded at or after the cutoff isn't installed;
     # exclude-newer-package gives the packages it names their own cutoff, or none (uv's `false`: None here).
     exclude_newer: datetime | None = None
+    constraint_paths: tuple[Path, ...] = ()
     exclude_newer_package: dict[str, datetime | None] = field(default_factory=dict)
     # A uv setting that may set a cutoff here but that wheelgap doesn't read, for a note.
     exclude_newer_unread: str | None = None
+    # The cutoffs above that came from a duration ("3 days"), which uv counts back from the time it resolves and
+    # wheelgap from the time of the run: each setting as written, with the cutoff it gave, for a note.
+    exclude_newer_durations: list[str] = field(default_factory=list)
     # Retain uv edge provenance for an explicit installation selection. The existing flattened
     # graph remains untouched, preserving conservative behavior when no selectors are supplied.
     uv_packages: list[dict] | None = None
@@ -165,6 +216,10 @@ class Source:
     uv_script: str | None = None
     uv_default_groups: list[str] = field(default_factory=lambda: ["dev"])
     uv_selection: UvSelection | None = None
+    # uv.lock only: its `conflicts` ([tool.uv] conflicts), each set as the names uv's markers give its items
+    # (`extra-4-demo-old`, `group-4-demo-cpu`, `project-4-demo`; check.py's _conflict_worlds). None when the lock
+    # has none, or when they can't be read, which leaves those names unknown.
+    uv_conflicts: list[list[str]] | None = None
     # A requirements file (requirements.txt, .in, requirements.lock): unpinned lines get the newest release.
     requirements: bool = False
     # pyproject.toml only: [project] optional-dependencies by canonical extra name, applied with --extra.
@@ -204,10 +259,23 @@ class Source:
     # The input names no index but PyPI, so a package this run found on pypi.org is a PyPI package (for --conda-forge,
     # which sends only such names). False when unsure: lockfiles rely on each package's registry instead.
     pypi_only: bool = False
+    # A requirements file's index options on lines of their own (`--extra-index-url URL`, in it or a file it
+    # includes), by their full names and never with their values, which may hold credentials: pip reads them and
+    # wheelgap doesn't, so the CLI says the file was checked on PyPI only.
+    index_options: list[str] = field(default_factory=list)
+    # The same for the other -r files of its pip install line, whose index options pip applies to it too: (the file
+    # that sets them, their names).
+    line_index_options: list[tuple[str, list[str]]] = field(default_factory=list)
     # A project directory with pixi.lock as well as the lockfile that was picked: the pixi.lock, for a note.
     passed_over: Path | None = None
+    # The input was a directory: which of its files this is and why (None for a file or package names).
+    found: DirectoryInput | None = None
     # A pip installation report captures one generating environment, not a cross-platform dependency graph.
     pip_report_env: dict[str, str] | None = None
+    # Its downloads include a musllinux-only wheel, which pip on glibc doesn't accept, or a manylinux-only one,
+    # which pip on musl doesn't accept: proof the resolution isn't one the other libc's pip makes.
+    pip_report_musl: bool = False
+    pip_report_glibc: bool = False
     # Requirements for --deps to resolve: package names on the command line, selected pyproject.toml
     # requirements, or a requirements file's requirement lines.
     specs: list[str] = field(default_factory=list)
@@ -225,6 +293,9 @@ class Source:
     deps_blockers: list[str] = field(default_factory=list)
     # A requirements file's --no-binary/--only-binary policy, applied to the resolved packages too.
     format_control: _FormatControl | None = None
+    # A requirements file's options that pip ignores after a requirement (`jax==0.4.25 -f URL`), for notes:
+    # `requirements.txt:2: pip ignores -f after a requirement`, once per file and option.
+    ignored_options: list[str] = field(default_factory=list)
     # --deps (deps.py): per target, the packages installed and the dependency path to each, keyed by index into
     # `packages`. check() uses it in place of a lockfile's graph.
     deps_paths: dict[Target, dict[int, list[str]]] | None = None
@@ -265,6 +336,97 @@ def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_on
         if not any(spec.contains(v, prereleases=True) for v in tries):
             out.append(t.python)
     return list(dict.fromkeys(out))
+
+
+def uv_ignores_python_rejection(requires: str, python: str) -> bool:
+    """Whether uv accepts a file that the index check rejected for this Python."""
+    # uv compares the lower edge of the complete release-only range:
+    # https://github.com/astral-sh/uv/blob/0.13.9/crates/uv-distribution-types/src/requires_python.rs#L246-L275
+    try:
+        spec = SpecifierSet(requires)
+        target = Version(f"{python}.99")
+        if spec.contains(target):
+            return False
+
+        # At equal versions an exclusive lower bound is higher than an inclusive one,
+        # so tuple comparison can pick the stricter bound.
+        lower: tuple[Version, bool] | None = None
+        upper: tuple[Version, bool] | None = None
+        exclusions: list[tuple[Version, Version | None]] = []
+        for clause in spec:
+            prefix = clause.version.endswith(".*")
+            version = Version(clause.version.removesuffix(".*"))
+            release = Version(version.base_version)
+            operator = clause.operator
+            successor = release
+            if prefix or operator == "~=":
+                segments = release.release if prefix else release.release[:-1]
+                successor = Version(".".join(map(str, (*segments[:-1], segments[-1] + 1))))
+                if prefix and version.epoch:
+                    successor = Version(f"{version.epoch}!{successor}")
+            if operator == "!=":
+                exclusions.append((release, successor if prefix else None))
+                continue
+            if operator in {">", ">=", "==", "===", "~="}:
+                candidate = (release, operator == ">")
+                lower = candidate if lower is None else max(lower, candidate)
+            if operator in {"<", "<=", "==", "===", "~="}:
+                candidate = (
+                    successor,
+                    operator in {"<=", "==", "==="} and not prefix,
+                )
+                upper = candidate if upper is None else min(upper, candidate)
+
+        if lower is None:
+            return True
+
+        for start, end in sorted(exclusions, key=lambda interval: interval[0]):
+            if start > lower[0]:
+                break
+            if end is None:
+                if start == lower[0]:
+                    lower = (start, True)
+            elif end > lower[0]:
+                lower = (end, False)
+
+        # uv treats an empty intersection as having no lower bound.
+        if upper is not None and (lower[0] > upper[0] or (lower[0] == upper[0] and (lower[1] or not upper[1]))):
+            return True
+        return lower <= (target, False)
+    except (InvalidSpecifier, InvalidVersion):
+        return False
+
+
+def restore_uv_python_files(packages: Iterable[Package], pythons: Iterable[str]) -> None:
+    """Apply uv's policy to the looked-up distributions for each Python."""
+    for pkg in packages:
+        restored_variants: list[Package] = []
+        for python in pythons:
+            variant = pkg.resolutions.get(python, pkg)
+            if variant.files is None or variant.error:
+                continue
+            # Index resolution coalesces identical answers. Copy before restoring files for just one Python.
+            refusals = {
+                filename: reason
+                for filename, reason in variant.requires_python_rejected.items()
+                if uv_ignores_python_rejection(reason.removeprefix("requires Python "), python)
+            }
+            if not refusals:
+                continue
+            restored = replace(
+                variant,
+                files=[*variant.files, *refusals],
+                requires_python_rejected={
+                    file: reason for file, reason in variant.requires_python_rejected.items() if file not in refusals
+                },
+                yanked=variant.yanked | (variant.python_rejected_yanked & refusals.keys()),
+                pip_refuses=refusals,
+                resolutions={},
+            )
+            variant = next((p for p in restored_variants if p == restored), restored)
+            if variant is restored:
+                restored_variants.append(restored)
+            pkg.resolutions[python] = variant
 
 
 def _filename(entry: dict, origin: str, package: str) -> str | None:
@@ -449,6 +611,14 @@ def _refuse_script_build_restrictions(path: Path) -> None:
         )
 
 
+def tool_table(data: dict, path: Path | str) -> dict:
+    """Return the [tool] table from parsed TOML, or raise SourceError when tool is not a table."""
+    tool = data.get("tool", {})
+    if not isinstance(tool, dict):
+        raise SourceError(f"{path}: [tool] must be a table")
+    return tool
+
+
 def _uv_build_restrictions(path: Path, source: Source) -> None:
     """Apply uv's project-level build and wheel restrictions to index packages in a lockfile.
 
@@ -471,9 +641,7 @@ def _uv_build_restrictions(path: Path, source: Source) -> None:
     except tomllib.TOMLDecodeError as exc:
         raise SourceError(f"{config_path}: invalid TOML: {exc}") from None
     setting_table = "uv.toml" if standalone else "[tool.uv]"
-    tool = data.get("tool", {})
-    if not isinstance(tool, dict):
-        raise SourceError(f"{config_path}: [tool] must be a table")
+    tool = tool_table(data, config_path)
     uv = data if standalone else tool.get("uv", {})
     if not isinstance(uv, dict):
         raise SourceError(f"{config_path}: {setting_table} must be a table")
@@ -560,7 +728,47 @@ def parse_uv_lock(path: Path) -> Source:
         source.edges = None  # no idea where the graph starts; treat every package as needed
     if isinstance(data.get("requires-python"), str):
         source.requires_python = data["requires-python"]
+    supported = data.get("supported-markers", [])
+    if not isinstance(supported, list) or not all(isinstance(marker, str) for marker in supported):
+        raise SourceError(f"{path.name}: `supported-markers` isn't a list of strings")
+    source.supported_markers = supported
+    source.uv_conflicts = _uv_conflicts(data.get("conflicts"))
     return source
+
+
+def uv_conflict_name(package: str, kind: str, name: str | None = None) -> str:
+    """The name uv's lock markers give a conflict item: `extra == 'extra-4-demo-old'` holds when the extra `old` of
+    the package `demo` is on. The number is the package name's length. encode_package_extra, encode_package_group and
+    encode_project in https://github.com/astral-sh/uv/blob/0.13.9/crates/uv-resolver-types/src/universal_marker.rs"""
+    package = canonicalize_name(package)
+    if kind == "project":
+        return f"project-{len(package)}-{package}"
+    return f"{kind}-{len(package)}-{package}-{canonicalize_name(name or '')}"
+
+
+def _uv_conflicts(conflicts: object) -> list[list[str]] | None:
+    """A uv.lock's `conflicts` as lists of uv_conflict_name names, or None when there are none or a set doesn't have
+    the shape uv writes (a list of tables, each with a `package` and at most one `extra` or `group`)."""
+    if not isinstance(conflicts, list) or not conflicts:
+        return None
+    sets: list[list[str]] = []
+    for items in conflicts:
+        if not isinstance(items, list):
+            return None
+        names: list[str] = []
+        for item in items:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("package"), str)
+                or len(item.keys() - {"package"}) > 1
+            ):
+                return None
+            kind = next(iter(item.keys() - {"package"}), "project")
+            if kind not in ("project", "extra", "group") or (kind != "project" and not isinstance(item[kind], str)):
+                return None
+            names.append(uv_conflict_name(item["package"], kind, item.get(kind)))
+        sets.append(names)
+    return sets
 
 
 def uv_selected_roots(source: Source) -> list[int]:
@@ -659,7 +867,10 @@ def select_uv_dependencies(
                 source.uv_default_groups = [canonicalize_name(g) for g in defaults]
             else:
                 raise SourceError(f"{pyproject}: [tool.uv] default-groups must be a list of strings or 'all'")
-        if source.edges is None:
+        # An empty lock (no packages: a Poetry project uv locked, or one with only empty dependency groups) has no
+        # roots, but nothing to install either: it goes on to the checks below, so a group its manifest lists is
+        # known, any other extra, group or default group is unknown, as uv sync says.
+        if source.edges is None and source.uv_packages:
             raise SourceError(f"{source.label}: cannot select extras/groups without project or manifest roots")
         packages = source.uv_packages or []
         roots = uv_selected_roots(source)
@@ -912,6 +1123,9 @@ def parse_pylock(path: Path) -> Source:
                 files.append(_filename(p["sdist"], path.name, pkg.name) or f"{p['name']}-{p.get('version')}.tar.gz")
                 pkg.sdist_url, pkg.sdist_sha256 = _sdist_source(p["sdist"], "hashes")
             pkg.files = files
+        requires = p.get("requires-python")
+        if pkg.files is not None and isinstance(requires, str):
+            pkg.locked_requires_python = requires
         pkgs.append(pkg)
     requires = data.get("requires-python")
     return Source(path.name, pkgs, requires_python=requires if isinstance(requires, str) else None)
@@ -933,6 +1147,8 @@ def parse_poetry_lock(path: Path) -> Source:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     metadata = data.get("metadata", {})
     legacy_files = metadata.get("files", {})
+    # Lock files before 2.1 (all of Poetry 1.x) only record markers on dependency edges, not on packages.
+    edge_markers_only = _version_tuple(str(metadata.get("lock-version", "2.1"))) < (2, 1)
     pkgs: list[Package] = []
     edges: dict[int, list[Edge]] = {}
     for p in data.get("package", []):
@@ -966,10 +1182,14 @@ def parse_poetry_lock(path: Path) -> Source:
                 None if entries is None else [f for f in (_filename(e, path.name, pkg.name) for e in entries) if f]
             )
         edges[len(pkgs)] = _poetry_edges(p)
+        requires = p.get("python-versions")
+        # Not before 2.1: a direct dependency's Python marker is only in pyproject.toml there, so the range could
+        # report a package for a Python that Poetry never installs it on (see Package.locked_requires_python).
+        if not edge_markers_only and pkg.files is not None and isinstance(requires, str):
+            pkg.locked_requires_python = requires
         pkgs.append(pkg)
-    # Lock files before 2.1 (all of Poetry 1.x) only record markers on dependency edges, not on
-    # packages, so walk the graph from the packages nothing depends on, as for uv.lock.
-    if _version_tuple(str(metadata.get("lock-version", "2.1"))) < (2, 1) and pkgs:
+    # With markers on edges only, walk the graph from the packages nothing depends on, as for uv.lock.
+    if edge_markers_only and pkgs:
         roots = set(_graph_roots(pkgs, edges))
         # The project's own dependencies are roots too, even if another package also depends on them
         # under a marker (colorama directly, and via click only on Windows).
@@ -1104,6 +1324,8 @@ def _add_once(pkgs: list[Package], seen: dict[tuple[str, str | None], Package], 
             first.registry = pkg.registry  # the other entry is from PyPI: this index decides for both
         else:
             first.skip = "private index"  # pinned to two indexes: no single lookup is safe for both
+    if first.locked_requires_python != pkg.locked_requires_python:
+        first.locked_requires_python = None  # conflicting entries can't establish a release-wide restriction
     if first.markers is not None:
         first.markers = None if pkg.markers is None else first.markers + pkg.markers
 
@@ -1114,6 +1336,7 @@ def parse_pdm_lock(path: Path) -> Source:
     legacy_files = metadata.get("files", {})
     locked_groups = metadata.get("groups")
     strategy = metadata.get("strategy")
+    inherit_metadata = isinstance(strategy, list) and "inherit_metadata" in strategy
     pkgs: list[Package] = []
     seen: dict[tuple[str, str | None], Package] = {}
     # Each package's groups, merged over its entries (PDM writes one per extras variant).
@@ -1148,6 +1371,10 @@ def parse_pdm_lock(path: Path) -> Source:
             if entries is not None:
                 pkg.files = [f for f in (_filename(e, path.name, pkg.name) for e in entries) if f]
             # Not in either place: leave files as None so the PyPI lookup fills them in.
+        requires = p.get("requires_python")
+        # Only with inherit_metadata, which records each package's marker (see Package.locked_requires_python).
+        if inherit_metadata and pkg.files is not None and isinstance(requires, str):
+            pkg.locked_requires_python = requires
         _add_once(pkgs, seen, pkg)
     return Source(
         path.name,
@@ -1158,7 +1385,7 @@ def parse_pdm_lock(path: Path) -> Source:
             if isinstance(locked_groups, list)
             else None
         ),
-        pdm_inherit_metadata=isinstance(strategy, list) and "inherit_metadata" in strategy,
+        pdm_inherit_metadata=inherit_metadata,
         pdm_pyproject=path.parent / "pyproject.toml",
     )
 
@@ -1406,7 +1633,9 @@ def _read_exclude_newer(source: Source, data: dict, path: Path, script: bool) ->
     """uv's exclude-newer and exclude-newer-package for this input (#521): from a script's own [tool.uv], or for a
     pyproject.toml from a uv.toml beside it when there is one (uv then ignores [tool.uv]), else its [tool.uv]. For a
     workspace member, uv reads the workspace root's settings in the same way and ignores the member's. A cutoff is a
-    timestamp or a date; uv's relative durations are refused, and so is anything else."""
+    timestamp, a date or a duration counted back from now (cutoff.parse_cutoff); anything else is refused. (uv
+    0.13.1 itself warns about a value it can't read and then ignores the file's settings; wheelgap stops, since the
+    project meant to set a cutoff.)"""
     workspace = None if script else _workspace_root(path, data)
     if script:
         settings, config = _table(_table(data, "tool"), "uv"), path
@@ -1431,14 +1660,23 @@ def _read_exclude_newer(source: Source, data: dict, path: Path, script: bool) ->
                 f"workspace root's settings ({config}), and so does wheelgap"
             )
     where = f"{config}:" if config.name == "uv.toml" else f"{config}: [tool.uv]"
-    if "exclude-newer" in settings:
+    now = cutoffs.current_time()  # one time for every duration in the file
+
+    def read(setting: str, value: object, or_false: str = "") -> datetime:
         try:
-            source.exclude_newer = parse_cutoff(settings["exclude-newer"])
+            cutoff = parse_cutoff(value, now)
         except ValueError as e:
+            table = " (wheelgap doesn't read uv's table form)" if isinstance(value, dict) else ""
             raise SourceError(
-                f"{where} exclude-newer must be a date or RFC 3339 timestamp: {e} "
-                "(wheelgap doesn't read uv's relative durations)"
+                f"{where} {setting} must be a date, an RFC 3339 timestamp{or_false or ' or'} a duration: {e}{table}"
             ) from None
+        if is_duration(value):
+            source.exclude_newer_durations.append(f'{setting} = "{value}" is {describe(cutoff)}')
+        return cutoff
+
+    # `exclude-newer = false` turns off a cutoff from settings uv reads before these (the user's own): none here.
+    if settings.get("exclude-newer", False) is not False:
+        source.exclude_newer = read("exclude-newer", settings["exclude-newer"], ", false or")
     per_package = settings.get("exclude-newer-package", {})
     if not isinstance(per_package, dict):
         raise SourceError(f"{where} exclude-newer-package must be a table of package names")
@@ -1446,13 +1684,9 @@ def _read_exclude_newer(source: Source, data: dict, path: Path, script: bool) ->
         key = canonicalize_name(name)
         if key in source.exclude_newer_package:
             raise SourceError(f"{where} exclude-newer-package names {key!r} twice once normalized")
-        try:
-            source.exclude_newer_package[key] = None if value is False else parse_cutoff(value)
-        except ValueError as e:
-            raise SourceError(
-                f"{where} exclude-newer-package {name} must be a date, an RFC 3339 timestamp or false: {e} "
-                "(wheelgap doesn't read uv's relative durations)"
-            ) from None
+        source.exclude_newer_package[key] = (
+            None if value is False else read(f"exclude-newer-package {name}", value, ", false or")
+        )
     if workspace is None:  # a workspace root always has settings: uv looks no further up
         source.exclude_newer_unread = _unread_exclude_newer(path, script)
 
@@ -1494,6 +1728,14 @@ def _builds_a_package(data: dict, path: Path) -> bool:
     return (isinstance(flit, dict) and "metadata" in flit) or (isinstance(pdm, dict) and "dependencies" in pdm)
 
 
+def _has_poetry_dependencies(data: dict) -> bool:
+    """Whether [tool.poetry.dependencies] names anything but python."""
+    tool = data.get("tool")
+    poetry = tool.get("poetry") if isinstance(tool, dict) else None
+    poetry_deps = poetry.get("dependencies") if isinstance(poetry, dict) else None
+    return isinstance(poetry_deps, dict) and any(dep.lower() != "python" for dep in poetry_deps)
+
+
 def _project_source(data: dict, path: Path, script: bool = False) -> Source:
     """Shared requirement and provenance handling for project and script metadata (`script`: a # /// script block,
     which errors name instead of [project])."""
@@ -1513,10 +1755,7 @@ def _project_source(data: dict, path: Path, script: bool = False) -> Source:
         # poetry-core 2 builds [tool.poetry.dependencies] into the package whenever [project] lists no dependencies
         # or optional-dependencies (missing or empty: DependencyGroup.dependencies' "legacy mode"). A groups-only file
         # with them is a Poetry project too: --group would leave its dependencies out.
-        tool = data.get("tool")
-        poetry = tool.get("poetry") if isinstance(tool, dict) else None
-        poetry_deps = poetry.get("dependencies") if isinstance(poetry, dict) else None
-        if isinstance(poetry_deps, dict) and any(dep.lower() != "python" for dep in poetry_deps):
+        if _has_poetry_dependencies(data):
             raise SourceError(
                 f"{path}: the dependencies are in [tool.poetry.dependencies], not [project] dependencies, "
                 "so wheelgap can't read them; check poetry.lock instead"
@@ -1707,17 +1946,31 @@ def _add_extras(source: Source, wanted: list[str]) -> None:
         pkg.exclude_newer = source.cutoff_for(pkg.key)
 
 
-def requirement_to_package(text: str, origin: str) -> Package:
+def requirement_to_package(text: str, origin: str, hashes: frozenset[str] = frozenset()) -> Package:
     try:
         req = Requirement(text)
     except InvalidRequirement as e:
         raise SourceError(f"{origin}: can't parse requirement {text!r}: {e}") from None
     markers = [str(req.marker)] if req.marker else None
     if req.url:
-        return Package(req.name, None, skip="url", origin=origin, markers=markers)
+        return Package(req.name, None, skip="url", origin=origin, markers=markers, hashes=hashes)
     version = _pinned_version(req)
     spec = str(req.specifier) if req.specifier and version is None else None
-    return Package(req.name, version, origin=origin, markers=markers, spec=spec)
+    written = _as_written(text, req.specifier) if spec else None
+    return Package(req.name, version, origin=origin, markers=markers, spec=spec, hashes=hashes, written_spec=written)
+
+
+def _as_written(text: str, specifier: SpecifierSet) -> str:
+    """The specifier's clauses in the order `text` writes them, or packaging's order when that can't be told (a clause
+    that isn't found exactly once)."""
+    flat = re.sub(r"\s+", "", text.split(";", 1)[0])
+    found = []
+    for clause in specifier:
+        hits = [m.start() for m in re.finditer(re.escape(str(clause)) + r"(?=,|\)|$)", flat)]
+        if len(hits) != 1:
+            return str(specifier)
+        found.append((hits[0], str(clause)))
+    return ",".join(clause for _, clause in sorted(found))
 
 
 # "name @ url", "name@url" and "name[extra] @ url": PEP 508 direct references, which Requirement parses.
@@ -1726,13 +1979,12 @@ _NAMED_URL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\s*(\[[^\]]*\])?\s*@")
 _EGG_RE = re.compile(r"[#&]egg=([A-Za-z0-9][A-Za-z0-9._-]*)")
 _COMMENT_RE = re.compile(r"\s#")
 _FULL_LINE_COMMENT_RE = re.compile(r"^\s*#")
-_INCLUDE_RE = re.compile(r"^(?:-r|--requirement)(?:\s+|=)?(\S.*)$")
-_CONSTRAINT_RE = re.compile(r"^(?:-c(?:\s+|=)?|--constraint(?:\s+|=))(\S.*)$")
 _VIA_COMMENT_RE = re.compile(r"^#\s*via\b")
 
 
 # pip options that point at an index or a folder of distributions other than PyPI's (or turn PyPI off).
-_INDEX_OPTIONS = ("--index-url", "--extra-index-url", "--find-links", "--no-index")
+# --pypi-url is pip's other name for --index-url.
+_INDEX_OPTIONS = ("--index-url", "--pypi-url", "--extra-index-url", "--find-links", "--no-index")
 
 
 def _names_index_option(line: str) -> bool:
@@ -1748,25 +2000,212 @@ def _names_index_option(line: str) -> bool:
     return False
 
 
+def _index_option_names(lines: Iterable[str]) -> list[str]:
+    """The index options pip reads on these lines of options, by their long names (`-i URL` is `--index-url`, the
+    abbreviation `--extra URL` is `--extra-index-url`), in order and once each. Tokens are read as pip's optparse reads
+    them (_REQUIREMENT_LINE_OPTIONS), so a value (`--trusted-host -ifoo`) and an ambiguous abbreviation (`--no`, which
+    pip refuses) name none. A requirement line is passed over: pip ignores an index option after a requirement, and
+    _requirement_options notes that. So is a line with -r or -c: pip reads the file it names and never applies the
+    line's other options (`_parse_and_recurse` doesn't hand the line to `handle_option_line`), so pip 26.3 doesn't
+    look in `--find-links wheels -r base.txt`'s folder."""
+    names: dict[str, None] = {}
+    for line in lines:
+        if not line.startswith("-"):
+            continue
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            continue
+        found: list[str] = []
+        include = False
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            i += 1
+            if token == "--":
+                break
+            if token.startswith("--"):
+                option, eq, _ = token.partition("=")
+                matches = (
+                    [option]
+                    if option in _LONG_LINE_OPTIONS
+                    else [n for n in _LONG_LINE_OPTIONS if n.startswith(option)]
+                )
+                if len(matches) != 1:
+                    continue
+                name, entry, attached = matches[0], _LONG_LINE_OPTIONS[matches[0]], bool(eq)
+            elif token.startswith("-") and token[:2] in _SHORT_LINE_OPTIONS:
+                entry = _SHORT_LINE_OPTIONS[token[:2]]
+                name, attached = entry[0][1], len(token) > 2  # `-fURL` holds its value
+            else:
+                continue
+            include = include or name in ("--requirement", "--constraint")
+            if name in _INDEX_OPTIONS:
+                found.append(name)
+            if entry[1] and not attached:  # `-i URL`, `--extra-index-url URL`: the next token is the value
+                i += 1
+        if not include:
+            names.update(dict.fromkeys(found))
+    return list(names)
+
+
 def _abbreviated_include(line: str) -> bool:
     """An abbreviation of --requirement or --constraint (`--requirem f`, `--cons f`), which pip reads but wheelgap
     doesn't follow: the file it names may set an index."""
-    option = line.split(None, 1)[0].split("=", 1)[0]
-    return (
-        len(option) > 2
-        and option not in ("--requirement", "--constraint")
-        and any(name.startswith(option) for name in ("--requirement", "--constraint"))
-    )
+    for token in line.split():
+        option = token.split("=", 1)[0]
+        if (
+            len(option) > 2
+            and option not in ("--requirement", "--constraint")
+            and any(name.startswith(option) for name in ("--requirement", "--constraint"))
+        ):
+            return True
+    return False
+
+
+# Line options that take a value, and those that don't, from pip's get_line_parser (SUPPORTED_OPTIONS and
+# SUPPORTED_OPTIONS_REQ in pip/_internal/req/req_file.py), less the includes and editables _line_include handles.
+_VALUE_OPTIONS = (
+    "--index-url",
+    "--extra-index-url",
+    "--find-links",
+    "--no-binary",
+    "--only-binary",
+    "--trusted-host",
+    "--use-feature",
+    "--hash",
+    "--config-settings",
+    "--all-releases",
+    "--only-final",
+)
+_FLAG_OPTIONS = ("--no-index", "--pre", "--prefer-binary", "--require-hashes")
+
+
+def _takes_value(token: str) -> bool:
+    """Whether optparse reads the token after this one as its value: `-i URL`, `--no-binary :all:`, or an
+    abbreviation optparse expands to one of these (`--extra URL`)."""
+    if token in ("-i", "-f", "-C"):  # -C is short for --config-settings
+        return True
+    if "=" in token or not token.startswith("--") or len(token) <= 2:
+        return False
+    if token in _VALUE_OPTIONS or token in _FLAG_OPTIONS:
+        return token in _VALUE_OPTIONS
+    matches = [name for name in _VALUE_OPTIONS + _FLAG_OPTIONS if name.startswith(token)]
+    return len(matches) == 1 and matches[0] in _VALUE_OPTIONS
+
+
+def _line_include(tokens: list[str], label: str) -> tuple[bool, str] | None:
+    """The file pip reads for a line of options, as (whether it's a constraints file, its path). optparse collects
+    every -r and -c on the line, and pip follows only the first -r, or the first -c if there's no -r
+    (`_parse_and_recurse` in pip/_internal/req/req_file.py). The spellings are `-r f`, `-rf`, `-r=f`,
+    `--requirement f` and `--requirement=f` (and the same for -c). `-r=f` is read as `f`, as wheelgap always has, though
+    pip's optparse would read a file named `=f`. None for a line pip reads as an editable
+    requirement, or one with an abbreviated include, which _abbreviated_include reports instead."""
+
+    def editable(token: str) -> bool:
+        option = token.partition("=")[0]
+        return (token.startswith("-e") and not token.startswith("--")) or (
+            len(option) > 3 and "--editable".startswith(option)
+        )
+
+    found: dict[bool, list[str]] = {False: [], True: []}
+    unread = ""  # an editable or an abbreviated include, which this function doesn't follow
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        i += 1
+        if token == "--":  # optparse reads no options after it
+            break
+        option, eq, value = token.partition("=")
+        if option in ("--requirement", "--constraint"):
+            name, constraint = option, option == "--constraint"
+        elif token.startswith(("-r", "-c")) and not token.startswith("--"):
+            name, constraint = token[:2], token.startswith("-c")
+            eq, value = ("=", token[2:].removeprefix("=")) if len(token) > 2 else ("", "")
+        else:
+            if editable(token):
+                unread = unread or "an editable"
+            elif _abbreviated_include(token):
+                unread = unread or "an abbreviated -r or -c"
+            if (
+                _takes_value(token)
+                or (editable(token) and not eq and token in ("-e", "--editable"))
+                # `--cons -C -r f`: -C is --cons's value, so pip reads the -r
+                or (token.startswith("--") and _abbreviated_include(token) and not eq)
+            ):
+                i += 1  # optparse takes the next token as this option's value: `--no-binary -r f` names no include
+            continue
+        if not eq:
+            value = tokens[i] if i < len(tokens) else ""
+            i += 1
+        if not value:
+            raise SourceError(f"{label}: {name} needs a file name")
+        found[constraint].append(value)
+    if unread:
+        if editable(tokens[0]) or not (found[False] or found[True]):
+            return None  # read as an editable, or reported by _abbreviated_include, as before
+        # pip's answer depends on options wheelgap doesn't read here, so a guess could leave packages out.
+        raise SourceError(f"{label}: wheelgap can't read a -r or -c on a line with {unread}: {' '.join(tokens)}")
+    if found[False]:
+        return False, found[False][0]
+    if found[True]:
+        return True, found[True][0]
+    return None
 
 
 class _FormatControl:
-    """Matches pip's FormatControl for --no-binary and --only-binary options in requirements files."""
+    """Matches pip's FormatControl for --no-binary and --only-binary options in requirements files, and the other
+    finder options of option lines that change which file or release pip picks: its ReleaseControl (--pre,
+    --all-releases, --only-final; pip/_internal/models/release_control.py) and --prefer-binary."""
 
     def __init__(self) -> None:
         self.no_binary: set[str] = set()
         self.only_binary: set[str] = set()
+        self.all_releases: set[str] = set()
+        self.only_final: set[str] = set()
+        # Where a release option or --prefer-binary was first read (`base.txt:1 sets --pre`), for --deps to refuse and
+        # the CLI's note.
+        self.release_set: str | None = None
+        self.prefer_binary: str | None = None
+
+    def apply_release(self, option: str, value: str) -> None:
+        """--all-releases or --only-final, as ReleaseControl.handle_mutual_excludes reads its value: `:all:` clears
+        both sets, and a name after it counts only after a `:none:`."""
+        target, other = (
+            (self.all_releases, self.only_final) if option == "--all-releases" else (self.only_final, self.all_releases)
+        )
+        new = value.split(",")
+        while ":all:" in new:
+            other.clear()
+            target.clear()
+            target.add(":all:")
+            del new[: new.index(":all:") + 1]
+            if ":none:" not in new:
+                return
+        for item in new:
+            if item == ":none:":
+                target.clear()
+                continue
+            key = canonicalize_name(item)
+            other.discard(key)
+            target.add(key)
+
+    def allows_prereleases(self, key: str) -> bool | None:
+        """ReleaseControl.allows_prereleases: a package named in a set wins over :all:."""
+        if key in self.all_releases:
+            return True
+        if key in self.only_final:
+            return False
+        if ":all:" in self.all_releases:
+            return True
+        if ":all:" in self.only_final:
+            return False
+        return None
 
     def apply(self, option: str, value: str) -> None:
+        if option in ("--all-releases", "--only-final"):
+            self.apply_release(option, value)
+            return
         target, other = (
             (self.no_binary, self.only_binary) if option == "--no-binary" else (self.only_binary, self.no_binary)
         )
@@ -1794,26 +2233,34 @@ class _FormatControl:
         return (False, False)
 
 
-def _join_continued_lines(text: str) -> list[str]:
-    """Joins backslash-continued non-comment lines without inserting spaces, matching pip's join_lines."""
-    joined: list[str] = []
+def _numbered_lines(text: str) -> list[tuple[int, str]]:
+    """Joins backslash-continued non-comment lines without inserting spaces, matching pip's join_lines. Each comes
+    with the number of the line it starts on, which is the one pip names in its errors."""
+    joined: list[tuple[int, str]] = []
     pending: list[str] = []
-    for line in text.splitlines():
+    start = 0
+    for number, line in enumerate(text.splitlines(), 1):
         is_comment = _FULL_LINE_COMMENT_RE.match(line) is not None
+        if not pending:
+            start = number
         if not line.endswith("\\") or is_comment:
             if is_comment:
                 line = " " + line
             if pending:
                 pending.append(line)
-                joined.append("".join(pending))
+                joined.append((start, "".join(pending)))
                 pending.clear()
             else:
-                joined.append(line)
+                joined.append((start, line))
         else:
             pending.append(line.strip("\\"))
     if pending:
-        joined.append("".join(pending))
+        joined.append((start, "".join(pending)))
     return joined
+
+
+def _join_continued_lines(text: str) -> list[str]:
+    return [line for _, line in _numbered_lines(text)]
 
 
 def _format_option(token: str) -> tuple[str, str | None] | None:
@@ -1859,37 +2306,233 @@ def _apply_format_options(line: str, format_control: _FormatControl) -> bool:
     return True
 
 
-def _exact_pins(entries: list[Package]) -> dict[str, str]:
-    """The constraints' exact versions: 1.9 and 1.9.0 are one version, and reversed() keeps the first spelling."""
-    return {canonicalize_version(e.version): e.version for e in reversed(entries) if e.version}
+def _apply_release_options(line: str, format_control: _FormatControl, where: str, handled: bool) -> None:
+    """The release options and --prefer-binary of a line of options, as pip 26.3 applies them. --all-releases and
+    --only-final change the install's settings from their parser callbacks, so they count on any line pip parses.
+    --pre and --prefer-binary count only where pip hands the line to handle_option_line (`handled`): not on a line
+    with -r or -c, whose file pip reads instead, so `--pre -r base.txt` takes no pre-release. `--pre` adds `:all:` to
+    the releases it allows, as handle_option_line does, without clearing --only-final's names."""
+    try:
+        tokens = shlex.split(line)
+    except ValueError:
+        return  # _read_requirements has refused the line already
+    refused = f"{where}: pip refuses this line:"
+    found: list[tuple[str, str | None]] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        i += 1
+        if token == "--":
+            break
+        value: str | None
+        if token.startswith("--"):
+            option, eq, given = token.partition("=")
+            matches = (
+                [option] if option in _LONG_LINE_OPTIONS else [n for n in _LONG_LINE_OPTIONS if n.startswith(option)]
+            )
+            if len(matches) != 1:
+                continue
+            name, entry, value = matches[0], _LONG_LINE_OPTIONS[matches[0]], given if eq else None
+        elif token.startswith("-") and token[:2] in _SHORT_LINE_OPTIONS:
+            entry = _SHORT_LINE_OPTIONS[token[:2]]
+            name, value = entry[0][1], token[2:] or None
+        else:
+            continue
+        if entry[1] and value is None:
+            value = tokens[i] if i < len(tokens) else None
+            i += 1
+        found.append((name, value))
+    # A line with -e is a requirement line to pip (ParsedLine.requirement is the editable), so handle_line never
+    # hands it to handle_option_line: pip 26.3 takes no pre-release for `--pre -e ./pkg`.
+    handled = handled and all(name != "--editable" for name, _ in found)
+    for name, value in found:
+        if name in ("--all-releases", "--only-final"):
+            if value is None:
+                raise SourceError(f"{refused} {name} option requires 1 argument")
+            if value.startswith("-"):
+                raise SourceError(f"{refused} --all-releases / --only-final option requires 1 argument.")
+            format_control.apply_release(name, value)
+            format_control.release_set = format_control.release_set or f"{where} sets {name}"
+        elif name == "--pre" and handled:
+            format_control.all_releases.add(":all:")
+            format_control.release_set = format_control.release_set or f"{where} sets --pre"
+        elif name == "--prefer-binary" and handled:
+            format_control.prefer_binary = format_control.prefer_binary or where
+
+
+def _is_prerelease(version: str) -> bool:
+    try:
+        return Version(version).is_prerelease
+    except InvalidVersion:  # an === pin of a version PEP 440 can't read: pip's filter keeps it
+        return False
+
+
+def _pin_specifier(version: str) -> str:
+    """The specifier of an exact pin: `==`, or `===` for a version PEP 440 can't read (which only `===` can pin)."""
+    try:
+        Version(version)
+    except InvalidVersion:
+        return f"==={version}"
+    return f"=={version}"
+
+
+def _specifier(entry: Package) -> str | None:
+    """What a requirement or constraint asks of the version, or None for a bare name, which asks nothing."""
+    return _pin_specifier(entry.version) if entry.version else entry.spec
+
+
+def _allows(version: str, specifiers: list[str]) -> bool:
+    """Whether pip takes `version` under all these specifiers at once, as it combines a requirement's with its
+    constraints': a pre-release counts (a pin names it), and `==1.0` takes `1.0+cpu`, as PEP 440's matching does."""
+    return all(SpecifierSet(specifier).contains(version, prereleases=True) for specifier in specifiers)
 
 
 def _constraint_error(entries: list[Package]) -> str | None:
     """Why these constraints on one package can't be applied as an index version or range, if they can't."""
     if any(entry.skip for entry in entries):
         return "constraint isn't an index version or range"
-    if len(_exact_pins(entries)) > 1:
+    # 1.9 and 1.9.0 are one version, and 1.0 with 1.0+cpu is 1.0+cpu (pip installs it): pins conflict only when no
+    # one of them matches them all.
+    pins = [entry.version for entry in entries if entry.version]
+    if pins and not any(_allows(pin, [_pin_specifier(other) for other in pins]) for pin in pins):
         return "constraints specify conflicting exact versions"
     return None
 
 
-def parse_requirements(path: Path) -> Source:
+def _constraint_conflict(pkg: Package, entries: list[Package]) -> str | None:
+    """Apply a requirement's unmarked constraints to it as pip does, or say why pip refuses them. A pin keeps its
+    version, or takes a constraint's local version that matches it (`==1.0` with `==1.0+cpu`); an exact constraint
+    becomes the version of an unpinned or ranged requirement; ranges are intersected, and a range that no release
+    matches is reported when the index is asked."""
+    specifiers = [specifier for entry in entries if (specifier := _specifier(entry))]
+    pins = [entry.version for entry in entries if entry.version]
+    own = _specifier(pkg)
+    if not pkg.version and not pins:
+        spec = SpecifierSet(pkg.spec or "")
+        for specifier in specifiers:
+            spec &= SpecifierSet(specifier)
+        pkg.spec = str(spec) or None
+        return None
+    candidates = ([pkg.version] if pkg.version else []) + pins
+    chosen = next((v for v in candidates if _allows(v, specifiers + ([own] if own else []))), None)
+    if chosen is not None:
+        pkg.version, pkg.spec = chosen, None
+        return None
+    # Name a constraint that the requirement's pin, or else the constraints' pin, falls outside.
+    shown = pkg.version or pins[0]
+    if own and not pkg.version and not _allows(shown, [own]):
+        blamed = next(entry for entry in entries if entry.version)
+        return f"requirement {pkg.name}{own} conflicts with the constraint {blamed.name}{_specifier(blamed)}"
+    rejecting = [entry for entry in entries if (s := _specifier(entry)) and not _allows(shown, [s])]
+    blamed = next((entry for entry in rejecting if not entry.version), rejecting[0])
+    first = f"requirement {pkg.name}{own}" if pkg.version else f"the constraint {pkg.name}=={shown}"
+    return f"{first} conflicts with the constraint {blamed.name}{_specifier(blamed)}"
+
+
+def parse_requirements(
+    path: Path, constraint_paths: tuple[Path, ...] = (), line_files: tuple[Path, ...] = ()
+) -> Source:
+    """`constraint_paths` are constraints files given beside the file (`pip install -r FILE -c CONSTRAINTS`): pip
+    reads them before FILE, so they count as a `-c CONSTRAINTS` line at the top of it would.
+
+    `line_files` are all the -r files of that one install (`pip install -r a.txt -r b.txt`), in the order of the line,
+    FILE among them. pip reads them into one install with one finder (get_requirements in
+    pip/_internal/cli/req_command.py at 26.3), after the constraints files and before it resolves, so the option
+    lines of every file (--no-binary, --only-binary, --pre, an index option) and the -c lines inside them count for
+    FILE's requirements too, in either order. Only FILE's own requirements are the source's packages."""
     constraints: list[Package] = []
     seen: dict[bool, set[Path]] = {False: set(), True: set()}  # requirement files, constraint files
     index_options: list[str] = []
     format_control = _FormatControl()
     req_lines: list[str] = []
     compiler_signs: list[str] = []
-    pkgs = _read_requirements(
-        path,
-        seen,
+    ignored_options: dict[tuple[Path, str], str] = {}
+    pkgs: list[Package] = []
+    for constraint_path in constraint_paths:
+        # What it returns is the requirements of a -r inside the constraints file (pip's rule): keep them, as
+        # _read_requirements does for a -c line.
+        pkgs.extend(
+            _read_requirements(
+                constraint_path,
+                seen,
+                constraints,
+                constraint=True,
+                index_options=index_options,
+                format_control=format_control,
+                req_lines=req_lines,
+                compiler_signs=compiler_signs,
+                ignored_options=ignored_options,
+            )
+        )
+    own = Path(os.path.abspath(path))
+    line_index_options: list[tuple[str, list[str]]] = []
+    for file in line_files or (path,):
+        if Path(os.path.abspath(file)) == own:
+            pkgs.extend(
+                _read_requirements(
+                    path,
+                    seen,
+                    constraints,
+                    index_options=index_options,
+                    format_control=format_control,
+                    req_lines=req_lines,
+                    compiler_signs=compiler_signs,
+                    ignored_options=ignored_options,
+                )
+            )
+        else:
+            line_index_options += _read_line_options(file, seen, constraints, format_control)
+    shared = [line for _, lines in line_index_options for line in lines]
+    source = _finalize_requirements(
+        path, pkgs, constraints, index_options + shared, format_control, req_lines, compiler_signs
+    )
+    source.index_options = _index_option_names(index_options)
+    source.line_index_options = [(name, _index_option_names(lines)) for name, lines in line_index_options]
+    source.ignored_options = list(ignored_options.values())
+    return source
+
+
+def _read_line_options(
+    file: Path, seen: dict[bool, set[Path]], constraints: list[Package], format_control: _FormatControl
+) -> list[tuple[str, list[str]]]:
+    """Read another -r file of a pip install line for what it sets for the whole install: its options into
+    `format_control`, its -c lines into `constraints`, and (returned) its index option lines, as (its name, lines).
+    Its requirements are its own source's. It gets its own record of requirement files read, so a file both include
+    still lists its packages in each; the constraints files read are shared (`seen`), so none is added twice."""
+    index_options: list[str] = []
+    _read_requirements(
+        file,
+        {False: set(), True: seen[True]},
         constraints,
         index_options=index_options,
         format_control=format_control,
-        req_lines=req_lines,
-        compiler_signs=compiler_signs,
     )
-    return _finalize_requirements(path, pkgs, constraints, index_options, format_control, req_lines, compiler_signs)
+    return [(file.name, index_options)] if index_options else []
+
+
+def parse_named_requirements(label: str, names: list[str], line_files: tuple[Path, ...]) -> Source:
+    """Requirements named on a pip install line (`pip install -r a.txt fastlib==2.0.0`), with what the line's -r and -c
+    files set for the whole install, as pip reads them with one finder (pip 26.3: --no-binary :all: in a.txt leaves
+    fastlib no wheel, in either order): the option lines, the -c lines inside them, and their index options. (A -c
+    FILE beside names on the line isn't read: dockerfile_requirements refuses it.)"""
+    constraints: list[Package] = []
+    seen: dict[bool, set[Path]] = {False: set(), True: set()}
+    format_control = _FormatControl()
+    line_index_options: list[tuple[str, list[str]]] = []
+    for file in line_files:
+        line_index_options += _read_line_options(file, seen, constraints, format_control)
+    pkgs = [requirement_to_package(name, label) for name in names]
+    shared = [line for _, lines in line_index_options for line in lines]
+    read = _finalize_requirements(Path(label), pkgs, constraints, shared, format_control, [], [])
+    source = Source(label, read.packages, pypi_only=not shared)
+    source.specs = list(names)
+    source.line_index_options = [(name, _index_option_names(lines)) for name, lines in line_index_options]
+    source.format_control = read.format_control
+    source.constraint_specs = read.constraint_specs
+    source.marker_constraint_specs = read.marker_constraint_specs
+    source.constraint_errors = read.constraint_errors
+    source.deps_blockers = read.deps_blockers
+    return source
 
 
 def _finalize_requirements(
@@ -1908,22 +2551,24 @@ def _finalize_requirements(
     marker_constraint_specs: dict[str, list[tuple[str, str]]] = {}
     constraint_errors: dict[str, str] = {}
     for pkg in pkgs:
-        if pkg.skip or pkg.version or not (entries := by_name.get(pkg.key)):
+        if pkg.skip or not (entries := by_name.get(pkg.key)):
             continue
         # --deps applies a marked constraint per target (resolve_deps), so only the unmarked ones can break it here.
-        if unmarked_error := _constraint_error([entry for entry in entries if not entry.markers]):
+        unmarked = [entry for entry in entries if not entry.markers]
+        if unmarked_error := _constraint_error(unmarked):
             constraint_errors[pkg.key] = unmarked_error
-        if any(entry.markers for entry in entries):
+        # A marked constraint that a pinned requirement already meets changes nothing, true or false; any other
+        # depends on the target.
+        if any(
+            entry.markers
+            and not (pkg.version and ((specifier := _specifier(entry)) is None or _allows(pkg.version, [specifier])))
+            for entry in entries
+        ):
             pkg.error = "constraint has an environment marker; target-dependent constraints aren't supported"
         elif unmarked_error:
             pkg.error = unmarked_error
-        elif pins := _exact_pins(entries):
-            pkg.version, pkg.spec = next(iter(pins.values())), None
-        else:
-            spec = SpecifierSet(pkg.spec or "")
-            for entry in entries:
-                spec &= SpecifierSet(entry.spec or "")
-            pkg.spec = str(spec) or None
+        elif conflict := _constraint_conflict(pkg, unmarked):
+            pkg.error = f"{conflict} (pip refuses this)"
     # A constraint on a package the file doesn't require only ever counts as a transitive dep's specifier,
     # which --deps sees; a constraint the file already called out as broken is left to constraint_errors.
     deps_blockers: list[str] = []
@@ -1945,11 +2590,28 @@ def _finalize_requirements(
     for pkg in pkgs:
         if not pkg.skip:
             pkg.no_binary, pkg.only_binary = format_control.policy(pkg.key)
+            pkg.prereleases = format_control.allows_prereleases(pkg.key)
+            if pkg.prereleases is False and pkg.version and not pkg.error and _is_prerelease(pkg.version):
+                # pip filters the candidates with prereleases=False, which leaves out even the one a pin names: pip
+                # 26.3 with `--only-final :all:` and `demo==2.0rc1` says "Could not find a final version".
+                pkg.error = (
+                    f"pip installs only final releases of {pkg.name} here (--only-final), so it finds no "
+                    f"{pkg.version} (pip refuses this)"
+                )
+    # These change which release pip picks for every dependency too, and the resolver doesn't read them yet.
+    if format_control.release_set:
+        deps_blockers.append(f"{format_control.release_set}, which changes the releases pip picks for dependencies")
+    if format_control.prefer_binary:
+        deps_blockers.append(
+            f"{format_control.prefer_binary} sets --prefer-binary, which changes the releases pip picks for "
+            "dependencies"
+        )
     return Source(
         path.name,
         pkgs,
         requirements=True,
         pypi_only=not index_options and not _nearby_config_names_an_index(path),
+        index_options=_index_option_names(index_options),
         specs=req_lines,
         compiled="hash" in compiler_signs,  # hash mode makes pip refuse anything unpinned: the file is complete
         constraint_specs=constraint_specs,
@@ -1958,6 +2620,166 @@ def _finalize_requirements(
         format_control=format_control,
         deps_blockers=deps_blockers + [f"{key}: {error}" for key, error in constraint_errors.items()],
     )
+
+
+def _shown(p: Path, stack: list[Path]) -> str:
+    # Names are relative to the folder the run started in, so two files with the same name in different
+    # folders stay distinguishable (a file outside that folder is ../name). Forward slashes on every
+    # platform, as the include lines themselves are written.
+    try:
+        return Path(os.path.relpath(p, stack[0].parent)).as_posix()
+    except ValueError:  # on another Windows drive: no relative path exists
+        return p.name
+
+
+def _cycle_error(path: Path, line: str, target_path: Path, stack: list[Path]) -> SourceError:
+    # The chain names files as they were written, so a cycle through a link names the link, as pip names it.
+    return SourceError(
+        f"{_shown(path, stack)}: {line} includes a file that is already being read "
+        f"({' -> '.join(_shown(p, stack) for p in (*stack, target_path))}); pip refuses this"
+    )
+
+
+def _include_error(path: Path, number: int | None, line: str, error: OSError, stack: list[Path]) -> SourceError:
+    """An included file that can't be read, named by the line that includes it (pip stops here too: "Could not
+    open requirements file")."""
+    where = _shown(path, stack) + (f":{number}" if number is not None else "")
+    why = "file not found" if isinstance(error, FileNotFoundError) else (error.strerror or str(error)).lower()
+    return SourceError(f"{where}: {line}: {why}")
+
+
+# What pip 26.3 does with each option it reads after a requirement on the same line. It parses the rest of the line
+# with the parser it uses for option lines (break_args_options and build_parser in pip/_internal/req/req_file.py), so
+# an unknown option, an ambiguous abbreviation or a missing value is an error. handle_line then hands the requirement
+# only --hash and --config-settings, and never calls handle_option_line for the line, so the index, include and
+# finder options are dropped ("ignored"). Some still take effect, because their parser callback changes the install's
+# own settings as the line is parsed: --no-binary and --only-binary ("format", which wheelgap reads) and
+# --all-releases and --only-final ("release", which wheelgap reads too), for the whole install. -e makes the line's
+# requirement an editable one, which pip refuses for a name. --use-feature turns the feature on for the run (its
+# parser list is shared), and no feature changes which file pip picks. Each entry: spellings, takes a value, kind.
+_REQUIREMENT_LINE_OPTIONS: tuple[tuple[tuple[str, ...], bool, str], ...] = (
+    (("-i", "--index-url", "--pypi-url"), True, "ignored"),
+    (("--extra-index-url",), True, "ignored"),
+    (("--no-index",), False, "ignored"),
+    (("-c", "--constraint"), True, "ignored"),
+    (("-r", "--requirement"), True, "ignored"),
+    (("-e", "--editable"), True, "editable"),
+    (("-f", "--find-links"), True, "ignored"),
+    (("--no-binary",), True, "format"),
+    (("--only-binary",), True, "format"),
+    (("--prefer-binary",), False, "ignored"),
+    (("--require-hashes",), False, "ignored"),
+    (("--no-require-hashes",), False, "ignored"),
+    (("--pre",), False, "ignored"),
+    (("--all-releases",), True, "release"),
+    (("--only-final",), True, "release"),
+    (("--trusted-host",), True, "ignored"),
+    (("--use-feature",), True, "feature"),
+    (("--hash",), True, "hash"),
+    (("-C", "--config-settings"), True, "requirement"),
+)
+_USE_FEATURE_CHOICES = (
+    "fast-deps",
+    "inprocess-build-deps",
+    "venv-isolation",
+    "truststore",
+    "no-binary-enable-wheel-cache",
+    "build-constraint",
+)
+_LONG_LINE_OPTIONS = {name: entry for entry in _REQUIREMENT_LINE_OPTIONS for name in entry[0] if name.startswith("--")}
+_SHORT_LINE_OPTIONS = {name: entry for entry in _REQUIREMENT_LINE_OPTIONS for name in entry[0] if len(name) == 2}
+
+
+def _requirement_options(
+    text: str, where: str
+) -> tuple[bool, list[tuple[str, str]], list[tuple[str, str]], frozenset[str]]:
+    """Reads the options after a requirement (`name>=1 --no-binary name`) as pip's optparse reads them: long options
+    by any unambiguous prefix, `--opt=value`, `-fVALUE`. Returns whether there's a --hash; each --no-binary,
+    --only-binary, --all-releases or --only-final as (long name, value) in order, for the install's format and release
+    control; what pip ignores there, for a note: each option as (the name it was written with, its long name), and
+    words that aren't options, which optparse sets aside, as one entry; and the frozenset of sha256 digests from
+    --hash options. SourceError where pip refuses the line, or where it applies an option that wheelgap doesn't read
+    (-e)."""
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        raise SourceError(f"{where}: pip can't split this line (an unclosed quote?): {text}") from None
+    refused = f"{where}: pip refuses this line:"
+    hashed = False
+    formats: list[tuple[str, str]] = []
+    ignored: list[tuple[str, str]] = []
+    sha256_hashes: set[str] = set()
+    k = 0
+    while k < len(tokens):
+        token = tokens[k]
+        k += 1
+        if token == "--" or not token.startswith("-") or token == "-":
+            # optparse sets these words aside (and every word after --), and pip drops them
+            if token != "--" or k < len(tokens):
+                ignored.append(("words that aren't options", ""))
+            if token == "--":
+                break
+            continue
+        value: str | None
+        if token.startswith("--"):
+            option, eq, given = token.partition("=")
+            matches = (
+                [option] if option in _LONG_LINE_OPTIONS else [n for n in _LONG_LINE_OPTIONS if n.startswith(option)]
+            )
+            if not matches:
+                raise SourceError(f"{refused} no such option: {option}")
+            if len(matches) > 1:
+                raise SourceError(f"{refused} ambiguous option: {option} ({', '.join(sorted(matches))}?)")
+            name = matches[0]
+            names, takes_value, kind = _LONG_LINE_OPTIONS[name]
+            value = given if eq else None
+            if value is not None and not takes_value:
+                raise SourceError(f"{refused} {name} option does not take a value")
+        else:
+            name = token[:2]
+            if name not in _SHORT_LINE_OPTIONS:
+                raise SourceError(f"{refused} no such option: {name}")
+            names, takes_value, kind = _SHORT_LINE_OPTIONS[name]
+            value = token[2:] or None  # every short option pip reads here takes a value: -fURL
+        if takes_value and value is None:
+            if k >= len(tokens):
+                raise SourceError(f"{refused} {name} option requires 1 argument")
+            value = tokens[k]  # optparse takes the next word, even one that starts with "-"
+            k += 1
+        given_value = value or ""
+        # The checks pip's parser callbacks make (the first is a CommandError, the others optparse errors).
+        if kind == "format" and given_value.startswith("-"):
+            raise SourceError(f"{refused} --no-binary / --only-binary option requires 1 argument.")
+        if kind == "release" and given_value.startswith("-"):
+            raise SourceError(f"{refused} --all-releases / --only-final option requires 1 argument.")
+        if kind == "hash":
+            if ":" not in given_value:
+                raise SourceError(
+                    f"{refused} Arguments to --hash must be a hash name followed by a value, "
+                    "like --hash=sha256:abcde..."
+                )
+            algo, _, digest = given_value.partition(":")
+            if algo not in ("sha256", "sha384", "sha512"):
+                raise SourceError(f"{refused} Allowed hash algorithms for --hash are sha256, sha384, sha512.")
+            if algo == "sha256":
+                sha256_hashes.add(digest.lower())
+        if kind == "requirement" and "=" not in given_value:
+            raise SourceError(f"{refused} Arguments to {name} must be of the form KEY=VAL")
+        if kind == "feature" and value not in _USE_FEATURE_CHOICES:
+            raise SourceError(f"{refused} option --use-feature: invalid choice: {value!r}")
+        if kind == "editable":
+            raise SourceError(
+                f"{where}: pip reads {name} after a requirement as making that requirement editable, and refuses it "
+                'for a name ("is not a valid editable requirement"); put the editable on a line of its own'
+            )
+        if kind == "ignored":
+            ignored.append((name, names[-1]))  # -f and --find-links are one option
+        hashed = hashed or kind == "hash"
+        if kind in ("format", "release") and given_value:
+            # The value pip's callback reads, never a word after another option; the callback applies it to the whole
+            # install, exactly as on a line of its own.
+            formats.append((name, given_value))
+    return hashed, formats, ignored, frozenset(sha256_hashes)
 
 
 def _read_requirements(
@@ -1969,65 +2791,134 @@ def _read_requirements(
     format_control: _FormatControl | None = None,
     req_lines: list[str] | None = None,
     compiler_signs: list[str] | None = None,
-    stack: dict[bool, set[Path]] | None = None,
+    stack: list[Path] | None = None,
     raw_lines: list[str] | None = None,
+    ignored_options: dict[tuple[Path, str], str] | None = None,
 ) -> list[Package]:
     """`index_options` collects the lines that may point pip at another index: index options (--index-url,
     --extra-index-url, --find-links, --no-index), includes that aren't read, and abbreviated include options.
     `req_lines` collects requirement lines that aren't constraints, for --deps; `compiler_signs` notes the
-    `--hash` options and `# via` comments that mark pip-compile output."""
-    path = path.resolve()
+    `--hash` options and `# via` comments that mark pip-compile output, in requirement files only.
+    `stack` is the chain of files being read, `-r` and `-c` together, as pip keeps it: by the path each
+    file was named with. `ignored_options` collects the options pip ignores after a requirement, once per file and
+    option, keyed by (resolved file, option), each a `path:line: ...` note.
+
+    A file is read through the folder it was named in (`os.path.abspath`, no symlink resolution), as pip
+    reads it, so an include in a symlinked file resolves against the link's folder, not the target's.
+    An include is a cycle when that named path is already in `stack`, which is pip's rule: one shared
+    file linked into two folders may be on the chain under both names, since its includes are other files
+    each time. The "already read" identity is the resolved path instead: a file reached by two names
+    lists its own lines once (pip would list them twice), but its includes are followed again, from the
+    folder of the new name."""
+    path = Path(os.path.abspath(path))
+    resolved = path.resolve()
     if stack is None:
-        stack = {False: set(), True: set()}
-    if path in stack[constraint]:
-        return []
-    already_seen = path in seen[constraint]
-    seen[constraint].add(path)
-    stack[constraint].add(path)
+        stack = []
+    already_seen = resolved in seen[constraint]
+    seen[constraint].add(resolved)
+    stack.append(path)
     pkgs: list[Package] = []
     try:
         append = constraints.append if constraint else pkgs.append
         # utf-8-sig: a byte order mark (Windows editors) mustn't hide an option on the first line.
-        lines = raw_lines if raw_lines is not None else _join_continued_lines(path.read_text(encoding="utf-8-sig"))
-        for raw in lines:
-            if compiler_signs is not None and _VIA_COMMENT_RE.match(raw.lstrip()):
+        numbered: list[tuple[int | None, str]] = (
+            [(None, raw) for raw in raw_lines]
+            if raw_lines is not None
+            else list(_numbered_lines(path.read_text(encoding="utf-8-sig")))
+        )
+        for number, raw in numbered:
+            if compiler_signs is not None and not constraint and _VIA_COMMENT_RE.match(raw.lstrip()):
                 compiler_signs.append("via")  # pip-compile writes "# via <name>" comment lines
             line = _COMMENT_RE.split(raw, 1)[0].strip()  # " # note" or "<TAB># note"
             if not line or line.startswith("#"):
                 continue
+            tokens = None
+            if line.startswith("-"):
+                try:
+                    tokens = shlex.split(line)  # as pip reads a line of options
+                except ValueError:
+                    raise SourceError(f"{path.name}: pip can't split this line (an unclosed quote?): {line}") from None
+            # Checked on the split tokens too, so a quoted option (`--pre "--req" more.txt`) is seen as pip sees it.
             if (
                 not already_seen
                 and index_options is not None
-                and (_names_index_option(line) or _abbreviated_include(line))
+                and any(
+                    _names_index_option(text) or _abbreviated_include(text)
+                    for text in (line, " ".join(tokens or []))
+                    if text
+                )
             ):
                 index_options.append(line)
-            if m := _CONSTRAINT_RE.match(line):
-                target = m.group(1).strip()
+            include = None
+            if tokens is not None:
+                include = _line_include(tokens, path.name)
+            if include and format_control is not None:
+                _apply_format_options(line, format_control)  # pip applies `--no-binary X -r f` before reading f
+                where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                _apply_release_options(line, format_control, where, handled=False)
+            if include and include[0]:
+                target = include[1]
                 # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before.
                 # Unread, it may name an index, so the input isn't PyPI-only.
                 if "://" not in target and "${" not in target:
-                    _read_requirements(
-                        path.parent / target, seen, constraints, True, index_options, format_control, stack=stack
-                    )
+                    # The include is read from the including file's folder as named, and that named
+                    # path is what the cycle check compares, as pip does.
+                    target_path = Path(os.path.abspath(path.parent / target))
+                    if target_path in stack:
+                        # An include naming a file already being read is an error, as pip refuses it:
+                        # the chain is one chain for -r and -c together, so a loop through a
+                        # constraints file is refused too.
+                        raise _cycle_error(path, line, target_path, stack)
+                    # A -r inside the constraints file is requirements, not more constraints (pip's rule),
+                    # so what it returns is packages, not constraints: keep them. req_lines and compiler_signs
+                    # are passed through for that -r file only: the constraints file's own lines add to neither.
+                    try:
+                        included = _read_requirements(
+                            path.parent / target,
+                            seen,
+                            constraints,
+                            True,
+                            index_options,
+                            format_control,
+                            req_lines,
+                            compiler_signs,
+                            stack=stack,
+                            ignored_options=ignored_options,
+                        )
+                    except OSError as e:  # the constraints file itself: one it includes is a SourceError by now
+                        raise _include_error(path, number, line, e, stack) from e
+                    pkgs.extend(included)
                 elif not already_seen and index_options is not None:
                     index_options.append(line)
                 continue
-            if m := _INCLUDE_RE.match(line):  # -r file, -rfile, --requirement file, --requirement=file
-                pkgs.extend(
-                    _read_requirements(
-                        path.parent / m.group(1).strip(),
+            if include:  # -r file, -rfile, --requirement file, --requirement=file, after other options too
+                target_path = Path(os.path.abspath(path.parent / include[1]))
+                if target_path in stack:
+                    raise _cycle_error(path, line, target_path, stack)
+                try:
+                    included = _read_requirements(
+                        path.parent / include[1],
                         seen,
                         constraints,
-                        constraint,
+                        False,  # a -r is requirements even inside a constraints file, as pip reads it
                         index_options,
                         format_control,
                         req_lines,
                         compiler_signs,
                         stack,
+                        ignored_options=ignored_options,
                     )
-                )
+                except OSError as e:  # the included file itself: one it includes is a SourceError by now
+                    raise _include_error(path, number, line, e, stack) from e
+                pkgs.extend(included)
                 continue
             if line.startswith("-e ") or line.startswith("--editable"):
+                if format_control is not None:
+                    # pip's parser callbacks apply `-e ./pkg --all-releases demo` and `-e ./pkg --no-binary demo` as
+                    # it reads the line, though the line is a requirement to pip (pip 26.3 ran both).
+                    _apply_format_options(line, format_control)
+                    where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                    _apply_release_options(line, format_control, where, handled=False)
                 if not already_seen:
                     name = line.split("#egg=", 1)[1] if "#egg=" in line else line.split(None, 1)[-1]
                     append(Package(name, None, skip="editable", origin=path.name))
@@ -2035,31 +2926,52 @@ def _read_requirements(
             if line.startswith("-"):
                 if format_control is not None:
                     _apply_format_options(line, format_control)
+                    where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                    _apply_release_options(line, format_control, where, handled=True)
                 continue  # pip options: --index-url, --no-binary, --hash continuation, ...
+            # The requirement ends where pip ends it: before the first word, split at single spaces, that starts
+            # with "-" (break_args_options), so "name\t--no-binary x" is one requirement pip can't parse. The rest is
+            # options: --hash=sha256:..., "--hash sha256:...", --no-binary NAMES.
+            words = line.split(" ")
+            first_option = next((k for k, word in enumerate(words) if word.startswith("-")), len(words))
+            options = " ".join(word for word in words[first_option:] if word)
+            hashed = False
+            req_hashes: frozenset[str] = frozenset()
+            if options:
+                where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                hashed, formats, ignored, req_hashes = _requirement_options(options, where)
+                if ignored_options is not None:
+                    for shown, option in ignored:
+                        note = f"{where}: pip ignores {shown} after a requirement"
+                        ignored_options.setdefault((resolved, option), note)
+                if format_control is not None:
+                    # Each time the line is read, as for an option line: pip reads a file included twice twice,
+                    # and the later option wins.
+                    for format_option, format_value in formats:
+                        format_control.apply(format_option, format_value)
+                        if format_option in ("--all-releases", "--only-final"):
+                            format_control.release_set = format_control.release_set or f"{where} sets {format_option}"
             if already_seen:
                 continue
-            tokens = line.split()
-            if compiler_signs is not None and any(t == "--hash" or t.startswith("--hash=") for t in tokens):
+            # Only on requirement lines: a --hash or "# via" in a constraints file never marked the input compiled.
+            if hashed and compiler_signs is not None and not constraint:
                 compiler_signs.append("hash")
-            # Drop --hash=sha256:... and "--hash sha256:..." (option and value as two tokens).
-            line = " ".join(
-                t for k, t in enumerate(tokens) if not t.startswith("--hash") and (k == 0 or tokens[k - 1] != "--hash")
-            )
+            line = " ".join(words[:first_option]).strip()
             if line.startswith((".", "/")):
-                append(Package(line, None, skip="path", origin=path.name))
+                append(Package(line, None, skip="path", origin=path.name, hashes=req_hashes))
                 continue
             if "://" in line and not _NAMED_URL_RE.match(line):
                 # A bare URL (git+ssh://git@github.com/org/repo.git#egg=foo): never from the index.
                 # "name @ url" lines are left to Requirement, which knows the name and markers.
                 egg = _EGG_RE.search(line)
                 name = egg.group(1) if egg else line.split(";", 1)[0].strip()
-                append(Package(name, None, skip="url", origin=path.name))
+                append(Package(name, None, skip="url", origin=path.name, hashes=req_hashes))
                 continue
-            append(requirement_to_package(line, path.name))
+            append(requirement_to_package(line, path.name, hashes=req_hashes))
             if req_lines is not None and not constraint:
                 req_lines.append(line)
     finally:
-        stack[constraint].remove(path)
+        stack.remove(path)
     return pkgs
 
 
@@ -2566,6 +3478,22 @@ def parse_pip_report(path: Path) -> Source:
             host = parsed.hostname if parsed else None
         except ValueError as e:
             raise SourceError(f"{path.name}: {name} has invalid download URL") from e
+        if parsed and parsed.path.endswith(".whl"):
+            try:
+                *_, wheel_tags = parse_wheel_filename(unquote(parsed.path.rsplit("/", 1)[-1]))
+            except InvalidWheelFilename:
+                pass
+            else:
+                platforms = {tag.platform for tag in wheel_tags}
+                # Evidence either way only when the other libc's pip couldn't accept the file: a wheel tagged
+                # for both families (or plain linux_, which both accept) is no evidence.
+                musllinux = any(t.startswith("musllinux") for t in platforms)
+                manylinux = any(t.startswith("manylinux") for t in platforms)
+                plain = any(t.startswith("linux") for t in platforms)
+                if musllinux and not manylinux and not plain:
+                    source.pip_report_musl = True
+                if manylinux and not musllinux and not plain:
+                    source.pip_report_glibc = True
         public_file = bool(parsed and parsed.scheme == "https" and host == "files.pythonhosted.org")
         skip = None
         if info.get("vcs_info") is not None:
@@ -2624,6 +3552,32 @@ def check_report_targets(source: Source, targets: Iterable[Target]) -> None:
             f"install other packages, so it can't be checked on {', '.join(other)}: check that target only, "
             "or make a report on each target"
         )
+    # musl and glibc record the same environment, but pip on musl accepts musllinux wheels and not manylinux
+    # ones, so it can install other packages. A wheel only one libc's pip accepts is proof the resolution isn't
+    # one the other's makes, so the other family is refused; a report with no such wheel either way is taken at
+    # face value, and one with both (pip run with two --platform values) is refused for both.
+    if source.pip_report_musl and source.pip_report_glibc:
+        if wrong := [t.label(True) for t in targets if PLATFORMS[t.platform][0] in ("manylinux", "musllinux")]:
+            raise SourceError(
+                f"{source.label}: this report downloaded both a musllinux wheel pip on glibc doesn't accept and a "
+                "manylinux wheel pip on musl doesn't accept (pip run with two --platform values?), so it isn't a "
+                f"resolution either libc's pip makes — it can't be checked on {', '.join(wrong)}: make one report "
+                "on glibc and one on musl"
+            )
+    if source.pip_report_musl:
+        if wrong := [t.label(True) for t in targets if PLATFORMS[t.platform][0] == "manylinux"]:
+            raise SourceError(
+                f"{source.label}: a download in this report is a musllinux wheel, which pip on glibc doesn't "
+                "accept, so this resolution isn't one glibc pip makes — it can't be checked on "
+                f"{', '.join(wrong)}: check a musl target, or make a report on glibc"
+            )
+    if source.pip_report_glibc:
+        if wrong := [t.label(True) for t in targets if PLATFORMS[t.platform][0] == "musllinux"]:
+            raise SourceError(
+                f"{source.label}: a download in this report is a manylinux wheel, which pip on musl doesn't "
+                "accept, so this resolution isn't one musl pip makes — it can't be checked on "
+                f"{', '.join(wrong)}: check a glibc target, or make a report on musl"
+            )
 
 
 def _conda_package_name(spec: str) -> str:
@@ -2680,6 +3634,7 @@ def parse_conda_env(path: Path) -> Source:
     format_control = _FormatControl()
     req_lines: list[str] = []
     compiler_signs: list[str] = []
+    ignored_options: dict[tuple[Path, str], str] = {}
     pkgs = _read_requirements(
         path,
         seen,
@@ -2689,9 +3644,12 @@ def parse_conda_env(path: Path) -> Source:
         req_lines=req_lines,
         compiler_signs=compiler_signs,
         raw_lines=pip_lines,
+        ignored_options=ignored_options,
     )
     pkgs.extend(conda_skips)
-    return _finalize_requirements(path, pkgs, constraints, index_options, format_control, req_lines, compiler_signs)
+    source = _finalize_requirements(path, pkgs, constraints, index_options, format_control, req_lines, compiler_signs)
+    source.ignored_options = list(ignored_options.values())
+    return source
 
 
 READERS = {
@@ -2717,11 +3675,30 @@ PARSERS = {
 }
 
 
-def load_file(path: Path, environment: str | None = None) -> Source:
-    """Read one input file. `environment` picks a pixi.lock environment (default: `default`)."""
-    kind = file_kind(path)
-    source = parse_pixi_lock(path, environment) if kind == "pixi" else READERS[kind](path)
-    source.path, source.kind = path, kind
+def load_file(
+    path: Path,
+    environment: str | None = None,
+    constraint_paths: tuple[Path, ...] = (),
+    *,
+    kind: str | None = None,
+    line_files: tuple[Path, ...] = (),
+) -> Source:
+    """Read one input file. `environment` picks a pixi.lock environment (default: `default`). `constraint_paths` are
+    the constraints files given beside a requirements file, and `line_files` the -r files of its install line (see
+    parse_requirements). `kind` overrides `file_kind(path)` when the caller already knows the format (for example
+    `pip install -r FILE` in a Dockerfile)."""
+    kind = kind or file_kind(path)
+    if constraint_paths and kind != "requirements":
+        raise SourceError(f"{path.name}: constraints files (pip install -c) only apply to a requirements file")
+    if len(line_files) > 1 and kind != "requirements":
+        raise SourceError(f"{path.name}: other -r files of an install line only apply to a requirements file")
+    if kind == "pixi":
+        source = parse_pixi_lock(path, environment)
+    elif constraint_paths or len(line_files) > 1:
+        source = parse_requirements(path, constraint_paths, line_files)
+    else:
+        source = READERS[kind](path)
+    source.path, source.kind, source.constraint_paths = path, kind, constraint_paths
     _check_field_types(path, source)
     return source
 
@@ -2778,18 +3755,415 @@ def find_lockfile(directory: Path, pixi: bool = False) -> Path:
         if candidate.is_file():
             return candidate
     hint = "Pass a file, or package names like `wheelgap numpy psycopg2`."
-    if _has_project_table(directory / "pyproject.toml"):
-        pyproject = directory / "pyproject.toml"
-        hint = f"To check the direct dependencies in its pyproject.toml, run `wheelgap {pyproject}`. " + hint
+    pyproject = directory / "pyproject.toml"
+    project_hint = _pyproject_hint(pyproject)
+    if project_hint:
+        hint = project_hint + " " + hint
     raise SourceError(f"no lockfile found in {directory} (looked for {', '.join(LOCKFILES)}). {hint}")
 
 
-def _has_project_table(pyproject: Path) -> bool:
-    """For the "no lockfile" hint only: a missing or unreadable file just means no hint."""
+class DirectoryChoiceError(SourceError):
+    """A directory with no input at its root that directory mode reads on its own, and more than one file to choose
+    from (or one it won't pick by itself). `candidates` are those files, for --json."""
+
+    def __init__(self, message: str, candidates: list[Path]) -> None:
+        super().__init__(message)
+        self.candidates = candidates
+
+
+# How far below a directory its inputs are looked for when the root has none (backend/requirements.txt is 1 deep),
+# and how many folders that search opens before it gives up, so a huge tree stays fast.
+NESTED_DEPTH = 3
+NESTED_FOLDERS = 2000
+# Candidates a "pick one" error lists before it counts the rest.
+CANDIDATES_LISTED = 10
+# Never searched: installed packages, not a project's inputs. Hidden folders and virtualenvs (a pyvenv.cfg) are
+# left out as well.
+_NEVER_SEARCHED = frozenset({"node_modules", "site-packages", "__pycache__"})
+# Words in a folder's or a requirements file's name (tests/, e2e_tests/, docs/, requirements-dev.txt) that say its
+# packages are for the tests, the docs, an example or development, not the project itself. Such an input is offered
+# when there is nothing else, and never checked on its own.
+_SIDE_WORDS = frozenset(
+    {"test", "tests", "testing", "example", "examples", "sample", "samples", "demo", "demos", "doc", "docs"}
+    | {"bench", "benchmark", "benchmarks", "fixtures", "templates"}
+    | {"dev", "develop", "development", "lint", "ci", "typing"}
+)
+
+
+def _is_side(name: str) -> bool:
+    return not _SIDE_WORDS.isdisjoint(re.split(r"[^a-z0-9]+", name.lower()))
+
+
+def _nothing_to_check(source: Source) -> str | None:
+    """Why a file gives a run nothing to check, or None when it lists a package from an index."""
+    if any(not p.skip for p in source.packages):
+        return None
+    reasons = sorted({p.skip for p in source.packages if p.skip})
+    what = f"only skipped entries ({', '.join(reasons)})" if reasons else "no packages"
+    if source.kind == "pixi":
+        return f"{what} in its default environment"
+    return what
+
+
+def _command(path: Path) -> str:
+    """`wheelgap PATH` as it can be pasted into a shell."""
+    quoted = subprocess.list2cmdline([str(path)]) if os.name == "nt" else shlex.quote(str(path))
+    return f"wheelgap {quoted}"
+
+
+# Text files in a requirements/ folder that aren't requirements files, by the start of their name (any case).
+_NOT_REQUIREMENTS: tuple[str, ...] = (
+    *("constraint", "readme", "license", "licence", "copying", "notice", "changelog", "changes"),
+    *("history", "authors", "contributing", "todo", "notes"),
+)
+
+
+def _other_requirements(directory: Path) -> list[Path]:
+    """Requirements files directory mode doesn't read by name: requirements*.txt and requirements*.in at the root,
+    and *.txt and *.in in requirements/ (not constraints*, README.txt and the like: _NOT_REQUIREMENTS). A .in beside
+    its compiled .txt is left out."""
+    found: list[Path] = []
+    for folder, prefix in ((directory, "requirements"), (directory / "requirements", "")):
+        try:
+            names = sorted(entry.name for entry in os.scandir(folder) if entry.is_file())
+        except OSError:
+            continue
+        for name in names:
+            stem, dot, suffix = name.rpartition(".")
+            if not dot or suffix not in ("txt", "in") or not name.startswith(prefix):
+                continue
+            if not prefix and stem.lower().startswith(_NOT_REQUIREMENTS):
+                continue
+            if suffix == "in" and f"{stem}.txt" in names:
+                continue
+            found.append(folder / name)
+    return found
+
+
+# The first line pip-compile and uv (`uv pip compile`, `uv export`) write.
+_COMPILER_HEADER_RE = re.compile(r"^#\s*This file (?:is|was) autogenerated by (?:pip-compile|uv)\b", re.MULTILINE)
+
+
+# A file beside pyproject.toml is opened only for a hint, so a bigger one is passed over unread (compiled locks of
+# large projects are well under this).
+_HINT_MAX_BYTES = 2_000_000
+
+
+def _looks_compiled_and_pinned(path: Path) -> bool:
+    """Whether a requirements file looks like a compiler's full pin list (pip-compile, `uv pip compile`, `uv export`):
+    it has their mark (their header, `# via` comments or `--hash` options), and it reads without an error, lists at
+    least one package from an index, and pins each to one version (`==` or `===`, from its line or a -c constraint).
+    A hint for the note beside pyproject.toml only: such a file may as well be the build tools' or the docs' pins
+    (flask's requirements/build.txt), so it is never read in pyproject.toml's place. Only the file itself is read:
+    one over _HINT_MAX_BYTES, or one with a -r or -c (which may name any file: a FIFO, a device, a huge one), doesn't
+    look compiled."""
     try:
-        return isinstance(tomllib.loads(pyproject.read_text(encoding="utf-8")).get("project"), dict)
-    except (OSError, ValueError):
+        if path.stat().st_size > _HINT_MAX_BYTES:
+            return False
+        text = path.read_text(encoding="utf-8-sig")
+        for _, raw in _numbered_lines(text):
+            line = _COMMENT_RE.split(raw, 1)[0].strip()
+            if line.startswith("-") and (_line_include(shlex.split(line), path.name) or _abbreviated_include(line)):
+                return False
+        source = load_file(path)
+    except Exception:  # unreadable or malformed: it doesn't look like anything
         return False
+    marked = (
+        source.compiled
+        or _COMPILER_HEADER_RE.search(text) is not None
+        or any(_VIA_COMMENT_RE.match(line.lstrip()) for line in text.splitlines())
+    )
+    packages = [p for p in source.packages if not p.skip]
+    return marked and bool(packages) and all(p.version is not None and p.error is None for p in packages)
+
+
+def _requirements_beside_pyproject(directory: Path) -> list[tuple[Path, bool]]:
+    """The requirements files under other names at a root whose pyproject.toml was read (_other_requirements, and
+    requirements*.lock at the root, which `wheelgap FILE` reads but directory mode doesn't), each with whether it
+    looks compiled and pinned; those first."""
+    try:
+        locks = sorted(
+            directory / entry.name
+            for entry in os.scandir(directory)
+            if entry.is_file()
+            and entry.name.startswith("requirements")
+            and entry.name.endswith(".lock")
+            and not entry.name.endswith(".py.lock")  # a script's lock, by file_kind
+            and entry.name not in LOCKFILES
+        )
+    except OSError:
+        locks = []
+    found = [(path, _looks_compiled_and_pinned(path)) for path in [*_other_requirements(directory), *locks]]
+    return [entry for entry in found if entry[1]] + [entry for entry in found if not entry[1]]
+
+
+def _unread_project(directory: Path) -> str | None:
+    """The file at the root that holds the project's own dependencies where wheelgap doesn't read them (setup.py,
+    setup.cfg, or a pyproject.toml load_file refused or took no project from), or None. With one, an input in a
+    subfolder isn't taken for the project's: it is more likely a tool's or a service's beside it."""
+    for name in ("setup.py", "setup.cfg"):
+        if (directory / name).is_file():
+            return name
+    try:
+        data = tomllib.loads((directory / "pyproject.toml").read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    except ValueError:
+        return "pyproject.toml"
+    if "project" in data or _builds_a_package(data, directory / "pyproject.toml") or _has_poetry_dependencies(data):
+        return "pyproject.toml"
+    return None
+
+
+def _folder_input(folder: Path, names: set[str]) -> Path | None:
+    """The file `wheelgap FOLDER` would read from a subfolder: its first lockfile in LOCKFILES order, else a
+    pyproject.toml that lists [project] dependencies."""
+    for name in LOCKFILES:
+        if name in names:
+            return folder / name
+    if "pyproject.toml" in names:
+        try:
+            source = load_file(folder / "pyproject.toml")
+        except Exception:  # unreadable or malformed: `wheelgap FOLDER` would have no answer either
+            return None
+        if not source.pyproject_groups_only and _nothing_to_check(source) is None:
+            return folder / "pyproject.toml"
+    return None
+
+
+def _nested_inputs(directory: Path) -> tuple[list[Path], list[Path], str]:
+    """Inputs up to NESTED_DEPTH folders below DIRECTORY, one per folder: (the project's, those under a folder
+    _is_side names, what kept the search from seeing the whole tree, in brackets, or ""). Breadth first and sorted,
+    so the answer doesn't depend on the file system's order. Symlinks aren't followed, and hidden folders,
+    virtualenvs and installed packages are left out."""
+    main: list[Path] = []
+    side: list[Path] = []
+    opened = 0
+    unread = ""
+    queue: deque[tuple[Path, int, bool]] = deque([(directory, 0, False)])
+    while queue:
+        folder, depth, is_side = queue.popleft()
+        if opened == NESTED_FOLDERS:
+            return main, side, f" (the search stopped after {NESTED_FOLDERS} folders)"
+        opened += 1
+        try:
+            entries = sorted(os.scandir(folder), key=lambda entry: entry.name)
+            files = {entry.name for entry in entries if entry.is_file(follow_symlinks=False)}
+            folders = [entry.name for entry in entries if entry.is_dir(follow_symlinks=False)]
+        except OSError:
+            # It may hold an input, so what was found elsewhere isn't known to be the only one.
+            unread = unread or f" ({folder} couldn't be read)"
+            continue
+        if depth:
+            if "pyvenv.cfg" in files:
+                continue  # a virtualenv
+            if (found := _folder_input(folder, files)) is not None:
+                (side if is_side else main).append(found)
+        if depth < NESTED_DEPTH:
+            for name in folders:
+                if not name.startswith(".") and name not in _NEVER_SEARCHED:
+                    queue.append((folder / name, depth + 1, is_side or _is_side(name)))
+    return main, side, unread
+
+
+def _choice_error(directory: Path, what: str, candidates: list[Path]) -> DirectoryChoiceError:
+    lines = [f"  {_command(path)}" for path in candidates[:CANDIDATES_LISTED]]
+    if len(candidates) > CANDIDATES_LISTED:
+        lines.append(f"  (and {len(candidates) - CANDIDATES_LISTED} more)")
+    return DirectoryChoiceError(
+        f"no lockfile, requirements.txt or pyproject.toml dependencies at the root of {directory}{what}:\n"
+        + "\n".join(lines),
+        candidates,
+    )
+
+
+def _load_picked(path: Path) -> Source:
+    """load_file for a file the search picked: the user didn't name it, so an error that doesn't must."""
+    try:
+        return load_file(path)
+    except UnicodeDecodeError as e:
+        raise SourceError(f"{path}: not UTF-8 text ({e.reason} at byte {e.start})") from None
+
+
+def _load_lockfile(directory: Path, environment: str | None = None) -> Source | None:
+    """The directory's first lockfile in LOCKFILES order (pixi.lock first when an environment is named), read; None
+    if it has none. A file with nothing to check (a requirements.txt that only says `.`, a pixi.lock of conda
+    packages) gives way to the next one that has something, then to pyproject.toml; if none has, it is the answer as
+    it always was."""
+    pixi_lock = directory / "pixi.lock"
+    if environment is not None and pixi_lock.is_file():
+        source = load_file(pixi_lock, environment)
+        source.found = DirectoryInput(directory, pixi_lock, "lockfile")
+        return source
+    pyproject = directory / "pyproject.toml"
+    at_root = [directory / name for name in LOCKFILES if (directory / name).is_file()]
+    if not at_root:
+        return None
+    first = load_file(at_root[0], environment)
+    first.found = DirectoryInput(directory, at_root[0], "lockfile")
+    if at_root[0] != pixi_lock and pixi_lock.is_file():
+        first.passed_over = pixi_lock
+    why = _nothing_to_check(first)
+    if why is None:
+        return first
+    empty = [(at_root[0], why)]
+    for path in [*at_root[1:], *([pyproject] if pyproject.is_file() else [])]:
+        try:
+            other = load_file(path)
+        except Exception:
+            continue  # unreadable or malformed: no better than the file that was found first
+        if other.pyproject_groups_only:
+            continue
+        why = _nothing_to_check(other)
+        if why is None:
+            other.found = DirectoryInput(directory, path, "pyproject" if path == pyproject else "lockfile", empty)
+            return other
+        empty.append((path, why))
+    return first
+
+
+def _load_subfolder(directory: Path, path: Path) -> Source:
+    """The one input in DIRECTORY's subfolders, read as `wheelgap FOLDER` reads its folder, and labelled with its
+    path in DIRECTORY (scripts/requirements.txt): a bare requirements.txt in the header, --markdown or --json's
+    sources would read as the root's."""
+    try:
+        source = _load_lockfile(path.parent) if path.name in LOCKFILES else load_file(path)
+    except UnicodeDecodeError as e:
+        raise SourceError(f"{path}: not UTF-8 text ({e.reason} at byte {e.start})") from None
+    assert source is not None
+    read = source.found.path if source.found is not None else path
+    source.found = DirectoryInput(directory, read, "subfolder", source.found.empty if source.found is not None else [])
+    source.label = read.relative_to(directory).as_posix()
+    return source
+
+
+def load_directory(directory: Path, environment: str | None = None) -> Source:
+    """Read a directory input. Its first lockfile in LOCKFILES order is read, as always (_load_lockfile). With none
+    of those names: the root's pyproject.toml if it lists [project] dependencies, else its only requirements file
+    under another name, else the only input in a subfolder. More than one to choose from is a DirectoryChoiceError
+    that lists them: wheelgap never picks one of several. `source.found` says what was read."""
+    if (at_root := _load_lockfile(directory, environment)) is not None:
+        return at_root
+    pyproject = directory / "pyproject.toml"
+
+    # A pyproject.toml with a [project] table that lists nothing is the answer only if nothing else turns up.
+    last_resort: Source | None = None
+    problem: str | None = None
+    if pyproject.is_file():
+        try:
+            source = load_file(pyproject)
+        except SourceError as e:
+            problem = str(e)
+        except Exception as e:  # malformed in a way its reader has no message for
+            problem = f"{pyproject}: {type(e).__name__}: {e}"
+        else:
+            if not source.pyproject_groups_only:
+                source.found = DirectoryInput(directory, pyproject, "pyproject")
+                if _nothing_to_check(source) is None or source.pyproject_extras:
+                    source.found.other_requirements = _requirements_beside_pyproject(directory)
+                    return source
+                last_resort = source
+    empty = [(pyproject, "no dependencies")] if last_resort is not None else []
+
+    others = _other_requirements(directory)
+    if len(others) > 1:
+        raise _choice_error(directory, ", and more than one requirements file to choose from. Check one", others)
+    if others and not _is_side(others[0].name.rpartition(".")[0]):
+        source = _load_picked(others[0])
+        source.found = DirectoryInput(directory, others[0], "requirements", empty)
+        return source
+
+    main, side, stopped = _nested_inputs(directory)
+    if len(main) == 1 and not stopped:
+        # Taken for the project's dependencies only where the root isn't a project of its own, and where no other
+        # requirements file could as well be the project's: the root's (dev or docs by its name, or it would have
+        # been read above) and, beside a subfolder's requirements file, the ones under another name
+        # (docker/main/requirements-wheels.txt).
+        rivals = list(others)
+        if file_kind(main[0]) == "requirements":
+            rivals += [
+                path
+                for path in _other_requirements(main[0].parent)
+                if path.name not in LOCKFILES and not _is_side(path.name.rpartition(".")[0])
+            ]
+        if last_resort is not None:
+            why = "Its pyproject.toml lists no dependencies"
+        elif (unread := _unread_project(directory)) is not None:
+            why = f"Its own dependencies are in {unread}, which wheelgap can't read"
+        elif rivals:
+            raise _choice_error(
+                directory,
+                ", and more than one file that could hold the project's dependencies. Check one",
+                [main[0], *rivals],
+            )
+        else:
+            return _load_subfolder(directory, main[0])
+        raise _choice_error(
+            directory,
+            f". {why}, so the one input in its subfolders isn't taken for the project's. To check that one",
+            main,
+        )
+    if main:
+        raise _choice_error(directory, f", but inputs in its subfolders{stopped}. Check one", main)
+    if last_resort is not None:
+        return last_resort
+    if others or side:
+        raise _choice_error(
+            directory,
+            f", and the only inputs it has are, by their names, for development, tests, docs or examples{stopped}, "
+            "which wheelgap doesn't check on its own. To check one",
+            [*others, *side],
+        )
+
+    looked = (
+        f"{', '.join(LOCKFILES)}, a pyproject.toml with [project] dependencies, requirements*.txt and "
+        f"requirements/*.txt there, and the lockfile names and pyproject.toml up to {NESTED_DEPTH} folders down"
+    )
+    hint = "Pass a file, or package names like `wheelgap numpy psycopg2`."
+    if problem is not None:
+        hint = f"Its pyproject.toml can't be checked ({problem}). {hint}"
+    elif project_hint := _pyproject_hint(pyproject):
+        hint = f"{project_hint} {hint}"
+    raise SourceError(f"no lockfile found in {directory}{stopped} (looked for {looked}). {hint}")
+
+
+# A dependency group's name as PEP 735 allows it: letters, digits, `.`, `-` and `_`, starting and ending with a
+# letter or digit.
+_GROUP_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+
+
+def pyproject_group_names(names: Iterable[str]) -> list[str]:
+    """The dependency group names a message may repeat, normalized and sorted: only those PEP 735 allows. The names
+    are text from the file, and these messages go to a terminal, a CI log or an MCP client."""
+    return sorted({canonicalize_name(name) for name in names if _GROUP_NAME.fullmatch(name)})
+
+
+def _pyproject_hint(pyproject: Path) -> str | None:
+    """For the "no lockfile" error only: the command that checks the folder's pyproject.toml instead, when there is
+    one that would work. A missing or unreadable file just means no hint."""
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(data.get("project"), dict):
+        return f"To check the direct dependencies in its pyproject.toml, run `wheelgap {pyproject}`."
+    groups = data.get("dependency-groups")
+    if "project" in data or not isinstance(groups, dict):
+        return None
+    # What _project_source refuses with --group: a setuptools, flit, PDM-legacy or Poetry project keeps its own
+    # dependencies outside [project], so the hint would only lead to that error.
+    if _builds_a_package(data, pyproject) or _has_poetry_dependencies(data):
+        return None
+    keys = [canonicalize_name(name) for name in groups]
+    if len(set(keys)) != len(keys):
+        return None  # two groups that are the same once normalized: refused whichever group is asked for
+    names = pyproject_group_names(groups)
+    if not names:
+        return None
+    return (
+        f"To check a dependency group in its pyproject.toml, run `wheelgap {pyproject} --group NAME` "
+        f"(groups: {', '.join(names)})."
+    )
 
 
 def parse_dist(path: Path) -> Source:
@@ -2826,9 +4200,20 @@ def parse_dist(path: Path) -> Source:
     return Source(path.name, [pkg])
 
 
-def load_inputs(inputs: list[str], environment: str | None = None) -> list[Source]:
-    """Each input is a file, a directory (lockfile auto-detected) or a requirement like 'numpy==2.3.4'.
-    `environment` picks the pixi.lock environment; with no pixi.lock input it's an error."""
+def load_inputs(
+    inputs: list[str],
+    environment: str | None = None,
+    *,
+    requirements_constraints: Mapping[Path, tuple[Path, ...]] | None = None,
+    file_kinds: Mapping[Path, str] | None = None,
+    requirements_line_files: Mapping[Path, tuple[Path, ...]] | None = None,
+) -> list[Source]:
+    """Each input is a file, a directory (its input is found by load_directory) or a requirement like 'numpy==2.3.4'.
+    `environment` picks the pixi.lock environment; with no pixi.lock input it's an error.
+    `requirements_constraints` maps a requirements file among the inputs to the constraints files given beside it
+    (--dockerfile-inputs: `pip install -r FILE -c CONSTRAINTS`), and `requirements_line_files` to all the -r files of
+    its install line (`pip install -r a.txt -r b.txt`), whose options pip applies to each of them.
+    `file_kinds` overrides `file_kind()` for specific files (e.g. `pip install -r` files with any name)."""
     if environment == "":
         raise SourceError("--environment needs a name")
     sources: list[Source] = []
@@ -2836,11 +4221,12 @@ def load_inputs(inputs: list[str], environment: str | None = None) -> list[Sourc
     for item in inputs:
         p = Path(item)
         if p.is_dir():
-            sources.append(load_file(find_lockfile(p, environment is not None), environment))
-            if sources[-1].kind != "pixi" and (p / "pixi.lock").is_file():
-                sources[-1].passed_over = p / "pixi.lock"
+            sources.append(load_directory(p, environment))
         elif p.is_file():
-            sources.append(load_file(p, environment))
+            constraints = requirements_constraints.get(p, ()) if requirements_constraints is not None else ()
+            kind = file_kinds.get(p) if file_kinds is not None else None
+            line_files = requirements_line_files.get(p, ()) if requirements_line_files is not None else ()
+            sources.append(load_file(p, environment, constraints, kind=kind, line_files=line_files))
         elif "/" in item or item.endswith((".lock", ".txt", ".toml", ".json", ".in", ".yml", ".yaml")):
             raise SourceError(f"{item}: no such file")
         else:

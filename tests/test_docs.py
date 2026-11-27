@@ -6,6 +6,7 @@ These read the Markdown sources directly, so they don't need MkDocs installed.
 import importlib.util
 import json
 import re
+import shlex
 from collections import Counter
 from pathlib import Path
 
@@ -19,6 +20,22 @@ ROOT = Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 FLAG = re.compile(r"(?<![\w-])--[a-z][a-z0-9-]*")
+
+
+@pytest.mark.parametrize("page", ["index.md", "output.md", "recipes.md"])
+def test_uvproj_text_sample(page, capsys, monkeypatch):
+    text = (DOCS / page).read_text(encoding="utf-8")
+    samples = re.findall(r"<!-- sample: uvproj ([^\n]+) -->\n```text\n(.*?)\n```", text, re.DOTALL)
+    assert len(samples) == 1, f"{page}: expected one marked uvproj text sample"
+    flags, documented = samples[0]
+    monkeypatch.chdir(ROOT / "tests" / "fixtures" / "uvproj")
+    # The lockfile contains all the files to check, and conftest forbids network requests.
+    # The explicit --offline flag would change the example by suppressing the --fix hint.
+    status = cli.main(["uv.lock", *shlex.split(flags)])
+    captured = capsys.readouterr()
+    assert status == 1, captured.err
+    expected = re.sub(r"^wheelgap \S+ ·", f"wheelgap {wheelgap.__version__} ·", documented)
+    assert expected + "\n" == captured.out, f"{page}: replace the sample with:\n```text\n{captured.out}```"
 
 
 def headings(path: Path) -> list[str]:

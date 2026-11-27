@@ -32,7 +32,7 @@ uv run --group dev pytest
 | `targets.py` | Targets (Python × platform) and the wheel tags each accepts |
 | `check.py` | The status per package and target (`wheel`, `source`, `missing`, `unknown`, `n/a`, `bundled`) and `--explain` reasons |
 | `pypi.py` | The only HTTP client (`fetch_json`: retries, https-only redirects; `fetch_sdist_pyproject` reads an sdist's `pyproject.toml` as pip would) and the PyPI lookups (`fill`, `fill_all`, `recheck_lock`) |
-| `cache.py` | The 24-hour on-disk cache of pinned PyPI lookups, `--conda-forge` and `--piwheels` lookups, the tracker's notes, `--build-info` answers and the `--fix` gap wheel list (`--no-cache` and `--online` skip it) |
+| `cache.py` | The 24-hour on-disk cache of pinned PyPI lookups, `--conda-forge` and `--piwheels` lookups, the tracker's notes, `--build-info` answers, and the `--fix` gap wheel list for an hour (`--no-cache` and `--online` skip it) |
 | `build.py` | `--explain --build-info`: what a `source` build needs, from the `[build-system]` table of the sdist's `pyproject.toml` (read with `pypi.fetch_sdist_pyproject`) |
 | `dockerfile.py` | `--dockerfile`: reads the final stage's image and platform the way Docker/BuildKit does |
 | `suggest_targets.py` | `--suggest-targets`: targets and Pythons read from GitHub Actions workflows and `.gitlab-ci.yml` (only files whose every line is in a small, strict subset of YAML), and from Dockerfiles |
@@ -43,6 +43,7 @@ uv run --group dev pytest
 | `origin.py` | `known_pypi`: whether a package is positively PyPI's, so its name may go to another service (`--conda-forge`, `--piwheels`, `--notes`); never for private-index names |
 | `notes.py` | `--explain`: the [coverage tracker](https://wheelgap.github.io/tracker/)'s notes for packages with gaps, opt-in with `--notes`, looked up only for names `origin.known_pypi` accepts (from `uv.lock` and `pylock.toml` for a registry), never with `--offline`, `--index-url` or a `WHEELGAP_INDEX_URL` mirror |
 | `gapwheels.py` | `--fix`: which gaps a wheel on wheelgap's gap wheel index fills (the list from `pypi.fetch_gap_wheels`, each entry checked and dropped whole if malformed), and how to install from the index; only for names `origin.known_pypi` accepts, never with `--offline`, `--index-url` or a mirror |
+| `fix.py` | `--fix`: each gap cell's way out, an upgrade first (the releases `--suggest` looks up, through `cli.release_lookups`), else a gap wheel (`gapwheels.py`), else none with the reason; the summary, and what to run or change per input |
 | `github.py` | `--github-annotations`: GitHub Actions `::error`/`::warning` lines, and each package's line in its input file |
 | `logsafe.py` | Keeps input text from running as a GitHub Actions workflow command: the CLI's and `diff`'s stdout and stderr go through `CommandGuard` |
 | `scan.py` | `python -m wheelgap.scan`: the data behind the [coverage tracker](https://wheelgap.github.io/tracker/) |
@@ -76,7 +77,7 @@ uv run --group dev pytest
 - **All network access goes through `pypi.py`:** `fetch_json` (or `fetch_simple` for `--index-url`), and `fetch_sdist_pyproject` for `--build-info`. A new kind of request goes there too, next to them.
 - **Wheel tags:** use `packaging.tags` where it has an API, and mirror what pip accepts. The manylinux/musllinux platform lists in `targets.py` follow pip's rules; keep them that way.
 - **`--dockerfile` must match Docker exactly or raise `DockerfileError`.** When you port BuildKit behaviour, link the file and commit in a comment (see `_heredocs` in `dockerfile.py`).
-- **Output:** `--json` keys are a public interface. Add keys; don't rename or remove them. Diagnostic notes (`wheelgap: note: ...`) go to stderr, never into `--json` or `--markdown` stdout.
+- **Output:** `--json` keys are a public interface. Add keys; don't rename or remove them. Diagnostic notes (`wheelgap: note: ...`) go to stderr, never into `--json` or `--markdown` stdout. The exception is what qualifies a `--dockerfile` answer (`dockerfile_notes`, `dockerfile_warnings`): those are structured `--json` keys, and the image ones are in `--markdown`, because CI needs to gate on them.
 - **Style:** match the surrounding code; ruff's line length is 120. Don't reformat or refactor code your change doesn't need.
 - **`CHANGELOG.md`:** if users would notice the change, add one bullet at the top of `## Unreleased`, written for users, ending with the **PR** number and your handle: `(#123, thanks [@you](https://github.com/you))`. Add it once the PR is open and you know the number. Docs-only changes get no entry, and released sections are never edited.
 - **Agent integrations:** when a flag, JSON key, status or exit code changes, update `integrations/claude-code/skills/check-wheels/SKILL.md` and `integrations/cursor/wheelgap.mdc` too, and only describe what's already released on PyPI.
@@ -97,7 +98,7 @@ uv run --group dev pytest
 A wrong answer from wheelgap that pip proves wrong is the most useful report there is. You may open a bug report for one yourself, and then fix it.
 
 1. Run wheelgap with `--explain` on a real lockfile, such as a popular open-source project's `uv.lock`, `poetry.lock` or pinned `requirements.txt`, across a few targets: `uvx wheelgap uv.lock -t all -p 3.13 -p 3.14t --explain`.
-2. Check a cell you doubt with pip, which has the last word. pip takes `manylinux` and `musllinux` tags literally, so pass every tag the target accepts, from its glibc or musl version down. For `linux-x86_64` with wheelgap's default glibc (2.36), in bash:
+2. Check a cell you doubt with pip, which has the last word (for a `uv.lock`, uv has it: see below). pip takes `manylinux` and `musllinux` tags literally, so pass every tag the target accepts, from its glibc or musl version down. For `linux-x86_64` with wheelgap's default glibc (2.36), in bash:
 
    ```bash
    platforms="$(for m in $(seq 36 -1 5); do printf -- '--platform manylinux_2_%s_x86_64 ' "$m"; done)"
@@ -108,7 +109,7 @@ A wrong answer from wheelgap that pip proves wrong is the most useful report the
 
    - **Other targets:**
      - for `linux-aarch64` and the other Linux arches, change the arch and stop the loop at 17 (`seq 36 -1 17`), with only `manylinux2014_<arch>` after it, since there are no older manylinux tags for them; for `linux-armv7l`, also pass `--platform linux_armv7l` (pip takes plain `linux_<arch>` wheels on every Linux arch, but PyPI only allows them for 32-bit ARM);
-     - for `musl-aarch64`, pass `--platform musllinux_1_2_aarch64 --platform musllinux_1_1_aarch64 --platform musllinux_1_0_aarch64`;
+     - for `musl-aarch64`, pass `--platform musllinux_1_2_aarch64 --platform musllinux_1_1_aarch64 --platform musllinux_1_0_aarch64 --platform linux_aarch64` (pip takes plain `linux_<arch>` wheels on musl too);
      - for Windows, pass one tag (`win_amd64`, `win_arm64`);
      - for macOS, pass the target's version (`macosx_14_0_arm64` for wheelgap's default, `--macos 14.0`). pip widens macOS tags to older versions itself.
    - **Other glibc or musl versions:** if you pass `--glibc` or `--musl` to wheelgap, start the list from that version. `wheelgap --list-targets` shows each target's floor.
@@ -116,6 +117,7 @@ A wrong answer from wheelgap that pip proves wrong is the most useful report the
    - **Reading the result:**
      - if pip downloads a wheel, wheelgap should say `wheel`;
      - if pip says "No matching distribution found", wheelgap should say `source` or `missing`. This check can't tell those two apart.
+   - **`uv.lock` cells:** check them with uv, not only pip. A `uv.lock` is answered the way `uv sync` installs it, and uv ignores `Requires-Python` upper bounds that pip enforces. So when pip refuses a pin only because its `Requires-Python` says `<3.15`, see what `uv sync --locked --python 3.15` does in a copy of the project before calling it a bug; `--online --explain` names the pins where the two differ.
 3. **Open an issue only when wheelgap and pip disagree** and no open issue covers it already. Use the [bug report](https://github.com/wheelgap/wheelgap/issues/new?template=bug_report.yml) template with both commands and both outputs.
 4. Limits:
    - one open self-filed issue per person at a time;

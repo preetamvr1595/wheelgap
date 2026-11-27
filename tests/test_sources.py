@@ -243,14 +243,440 @@ def test_requirements_nested_constraints_combine_ranges_and_keep_pins(tmp_path):
     path = tmp_path / "requirements.txt"
     path.write_text("-r sub/more.txt\n-c sub/constraints.txt\n", encoding="utf-8")
     (directory / "more.txt").write_text("ranged>=1.5\npinned==3\n", encoding="utf-8")
-    (directory / "constraints.txt").write_text("-c nested.txt\npinned==1\n", encoding="utf-8")
-    (directory / "nested.txt").write_text(
-        "ranged<2 \\\n    --hash=sha256:00  # note\n-c constraints.txt\n", encoding="utf-8"
-    )
+    (directory / "constraints.txt").write_text("-c nested.txt\npinned==3\n", encoding="utf-8")
+    (directory / "nested.txt").write_text("ranged<2 \\\n    --hash=sha256:00  # note\n", encoding="utf-8")
     ranged, pinned = parse_requirements(path).packages
     assert ranged.spec == "<2,>=1.5"
     assert ranged.version is None
     assert pinned.version == "3"
+    assert pinned.error is None
+
+
+@pytest.mark.parametrize(
+    "req,constraint,expected_version,expected_spec,expected_error",
+    [
+        (
+            "idna==3.6",
+            "idna==3.7",
+            "3.6",
+            None,
+            "requirement idna==3.6 conflicts with the constraint idna==3.7 (pip refuses this)",
+        ),
+        (
+            "idna==3.6",
+            "idna>=3.7",
+            "3.6",
+            None,
+            "requirement idna==3.6 conflicts with the constraint idna>=3.7 (pip refuses this)",
+        ),
+        (
+            "idna>=3.8",
+            "idna==3.7",
+            None,
+            ">=3.8",
+            "requirement idna>=3.8 conflicts with the constraint idna==3.7 (pip refuses this)",
+        ),
+        (
+            "idna==1.9",
+            "idna==1.9.0",
+            "1.9",
+            None,
+            None,
+        ),
+        (
+            "idna==3.6",
+            "idna>=3.0",
+            "3.6",
+            None,
+            None,
+        ),
+        # pip 26.3 checked: ==1.0 matches 1.0+local (PEP 440), so pip installs 1.0+local whichever side names it.
+        ("demo==1.0+local", "demo==1.0", "1.0+local", None, None),
+        ("demo==1.0", "demo==1.0+local", "1.0+local", None, None),
+        (
+            "demo==1.0+local",
+            "demo==1.0+cpu",
+            "1.0+local",
+            None,
+            "requirement demo==1.0+local conflicts with the constraint demo==1.0+cpu (pip refuses this)",
+        ),
+        (
+            "demo==1.0+cpu",
+            "demo!=1.0",
+            "1.0+cpu",
+            None,
+            "requirement demo==1.0+cpu conflicts with the constraint demo!=1.0 (pip refuses this)",
+        ),
+        ("demo==1.0+cpu", "demo==1.0\ndemo==1.0+cpu", "1.0+cpu", None, None),
+        ("demo", "demo==1.0\ndemo==1.0+cpu", "1.0+cpu", None, None),
+        # A pinned pre-release counts, as pip takes it; <2.0 leaves out 2.0's pre-releases.
+        ("demo==2.0b1", "demo>=1.0", "2.0b1", None, None),
+        ("demo>=1.0", "demo==2.0b1", "2.0b1", None, None),
+        (
+            "demo==2.0b1",
+            "demo<2.0",
+            "2.0b1",
+            None,
+            "requirement demo==2.0b1 conflicts with the constraint demo<2.0 (pip refuses this)",
+        ),
+        (
+            "demo==1!1.0",
+            "demo==1.0",
+            "1!1.0",
+            None,
+            "requirement demo==1!1.0 conflicts with the constraint demo==1.0 (pip refuses this)",
+        ),
+        ("demo==3.6", "demo", "3.6", None, None),
+        # An exact constraint must meet the other constraints too.
+        (
+            "demo>=1",
+            "demo==2.0\ndemo<1.5",
+            None,
+            ">=1",
+            "the constraint demo==2.0 conflicts with the constraint demo<1.5 (pip refuses this)",
+        ),
+        # A marked constraint that the pin meets changes nothing on any target; one it doesn't depends on the target.
+        ("idna==3.6", 'idna==3.6; sys_platform == "win32"', "3.6", None, None),
+        (
+            "idna==3.6",
+            'idna==3.7; sys_platform == "win32"',
+            "3.6",
+            None,
+            "constraint has an environment marker; target-dependent constraints aren't supported",
+        ),
+    ],
+)
+def test_requirements_constraint_conflict_and_agreement(
+    tmp_path, req, constraint, expected_version, expected_spec, expected_error
+):
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{req}\n-c constraints.txt\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text(f"{constraint}\n", encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert pkg.version == expected_version
+    assert pkg.spec == expected_spec
+    assert pkg.error == expected_error
+
+
+def test_requirements_conflict_from_nested_constraints_file(tmp_path):
+    path = tmp_path / "requirements.txt"
+    path.write_text("idna==3.6\n-c constraints.txt\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text("-c nested.txt\n", encoding="utf-8")
+    (tmp_path / "nested.txt").write_text("idna==3.7\n", encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert pkg.version == "3.6"
+    assert pkg.error == "requirement idna==3.6 conflicts with the constraint idna==3.7 (pip refuses this)"
+
+
+def test_requirements_requirement_inside_constraints_file(tmp_path):
+    # pip reads a -r inside a constraints file as requirements, not more constraints (#602):
+    # the included file's packages are checked, while the constraints file's own lines stay constraints.
+    path = tmp_path / "a.txt"
+    path.write_text("-c cons.txt\nrequests==2.32.5\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("-r extra.txt\nurllib3<3\n", encoding="utf-8")
+    (tmp_path / "extra.txt").write_text("psycopg2==2.9.11\n", encoding="utf-8")
+    src = parse_requirements(path)
+    assert [(p.name, p.version, p.origin) for p in src.packages] == [
+        ("psycopg2", "2.9.11", "extra.txt"),
+        ("requests", "2.32.5", "a.txt"),
+    ]
+    assert src.constraint_specs == {"urllib3": {"<3"}}
+
+
+def test_requirements_requirement_inside_constraints_file_keeps_compiler_signs(tmp_path):
+    # A -r inside a constraints file is read as requirements, with compiler signs (#602): a pip-compile
+    # file reached that way still marks the input compiled, as a direct -r does.
+    path = tmp_path / "a.txt"
+    path.write_text("-c cons.txt\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("-r reqs.txt\n", encoding="utf-8")
+    (tmp_path / "reqs.txt").write_text("lib==2.0 \\\n    --hash=sha256:aa\n    # via app\n", encoding="utf-8")
+    src = parse_requirements(path)
+    assert src.compiled
+    assert [(p.name, p.version) for p in src.packages] == [("lib", "2.0")]
+
+
+def test_requirements_hashes_in_a_constraints_file_do_not_mark_the_input_compiled(tmp_path):
+    # Only requirement lines mark the input compiled: a constraints file with --hash lines and "# via" comments
+    # (pip-compile output used with -c) leaves it as it was, so --deps still resolves the requirements (#602).
+    path = tmp_path / "a.txt"
+    path.write_text("lib==2.0\n-c cons.txt\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text(
+        "lib==2.0 \\\n    --hash=sha256:aa\n    # via app\n-c nested.txt\n", encoding="utf-8"
+    )
+    (tmp_path / "nested.txt").write_text("other==1.0 --hash=sha256:bb\n", encoding="utf-8")
+    src = parse_requirements(path)
+    assert not src.compiled
+    assert [(p.name, p.version) for p in src.packages] == [("lib", "2.0")]
+
+
+def test_requirements_nested_includes_keep_their_kind(tmp_path):
+    # pip: a -r file is requirements and a -c file is constraints, whatever file the line is in (#602).
+    # top -c c1 -> -r r1 -> -c c2, and top -r r2 -> -c c3 -> -r r3, with includes in subfolders
+    # resolved against the including file's folder.
+    (tmp_path / "sub" / "deep").mkdir(parents=True)
+    path = tmp_path / "top.txt"
+    path.write_text("-c sub/c1.txt\n-r sub/r2.txt\ntopreq\n", encoding="utf-8")
+    (tmp_path / "sub" / "c1.txt").write_text("-r deep/r1.txt\nfromc1<2\n", encoding="utf-8")
+    (tmp_path / "sub" / "deep" / "r1.txt").write_text("-c c2.txt\nfromr1==1.0\n", encoding="utf-8")
+    (tmp_path / "sub" / "deep" / "c2.txt").write_text("fromc2<3\n", encoding="utf-8")
+    (tmp_path / "sub" / "r2.txt").write_text("-c deep/c3.txt\nfromr2==2.0\n", encoding="utf-8")
+    (tmp_path / "sub" / "deep" / "c3.txt").write_text("-r r3.txt\nfromc3<4\n", encoding="utf-8")
+    (tmp_path / "sub" / "deep" / "r3.txt").write_text("fromr3==3.0\n", encoding="utf-8")
+    src = parse_requirements(path)
+    assert [(p.name, p.version, p.origin) for p in src.packages] == [
+        ("fromr1", "1.0", "r1.txt"),
+        ("fromr3", "3.0", "r3.txt"),
+        ("fromr2", "2.0", "r2.txt"),
+        ("topreq", None, "top.txt"),
+    ]
+    assert src.constraint_specs == {"fromc1": {"<2"}, "fromc2": {"<3"}, "fromc3": {"<4"}}
+
+
+def test_requirements_include_cycle_through_a_constraints_file_is_an_error(tmp_path):
+    # a.txt -c cons.txt -r a.txt: the chain is one chain for -r and -c together, so pip refuses the loop (#603).
+    path = tmp_path / "a.txt"
+    path.write_text("-c cons.txt\npurewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("-r a.txt\nranged<2\n", encoding="utf-8")
+    with pytest.raises(SourceError) as caught:
+        parse_requirements(path)
+    assert str(caught.value) == (
+        "cons.txt: -r a.txt includes a file that is already being read (a.txt -> cons.txt -> a.txt); pip refuses this"
+    )
+
+
+def test_requirements_two_file_include_cycle_is_an_error(tmp_path):
+    # The issue's example: c1.txt -r c2.txt -r c1.txt. pip refuses it, and so does wheelgap (#603).
+    path = tmp_path / "c1.txt"
+    path.write_text("-r c2.txt\nrequests==2.32.5\n", encoding="utf-8")
+    (tmp_path / "c2.txt").write_text("-r c1.txt\nidna==3.11\n", encoding="utf-8")
+    with pytest.raises(SourceError) as caught:
+        parse_requirements(path)
+    assert str(caught.value) == (
+        "c2.txt: -r c1.txt includes a file that is already being read (c1.txt -> c2.txt -> c1.txt); pip refuses this"
+    )
+
+
+@pytest.mark.parametrize("line", ["-r a.txt", "-c a.txt"])
+def test_requirements_file_including_itself_is_an_error(tmp_path, line):
+    # A file that includes itself, with -r or -c, is a cycle pip refuses (#603).
+    path = tmp_path / "a.txt"
+    path.write_text(line + "\nrequests==2.32.5\n", encoding="utf-8")
+    with pytest.raises(SourceError) as caught:
+        parse_requirements(path)
+    assert str(caught.value) == (
+        f"a.txt: {line} includes a file that is already being read (a.txt -> a.txt); pip refuses this"
+    )
+
+
+def test_requirements_three_file_include_cycle_is_an_error(tmp_path):
+    # The chain is named in full, from the file the run started with (#603).
+    path = tmp_path / "a.txt"
+    path.write_text("-r b.txt\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("-r c.txt\n", encoding="utf-8")
+    (tmp_path / "c.txt").write_text("-r a.txt\n", encoding="utf-8")
+    with pytest.raises(SourceError) as caught:
+        parse_requirements(path)
+    assert str(caught.value) == (
+        "c.txt: -r a.txt includes a file that is already being read "
+        "(a.txt -> b.txt -> c.txt -> a.txt); pip refuses this"
+    )
+
+
+def test_requirements_cycle_names_are_relative_to_the_starting_folder(tmp_path):
+    # Two files with the same name in different folders stay distinguishable in the chain (#603).
+    path = tmp_path / "a.txt"
+    path.write_text("-r sub/a.txt\n", encoding="utf-8")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "a.txt").write_text("-r ../a.txt\n", encoding="utf-8")
+    with pytest.raises(SourceError) as caught:
+        parse_requirements(path)
+    assert str(caught.value) == (
+        "sub/a.txt: -r ../a.txt includes a file that is already being read "
+        "(a.txt -> sub/a.txt -> a.txt); pip refuses this"
+    )
+
+
+def test_requirements_cycle_names_a_file_above_the_starting_folder_by_its_relative_path(tmp_path):
+    # A cycle that leaves the starting folder: the file above it is ../a.txt, not a second "a.txt" (#603).
+    (tmp_path / "reqs").mkdir()
+    path = tmp_path / "reqs" / "a.txt"
+    path.write_text("-r ../a.txt\n", encoding="utf-8")
+    (tmp_path / "a.txt").write_text("-r reqs/a.txt\n", encoding="utf-8")
+    with pytest.raises(SourceError) as caught:
+        parse_requirements(path)
+    assert str(caught.value) == (
+        "../a.txt: -r reqs/a.txt includes a file that is already being read "
+        "(a.txt -> ../a.txt -> a.txt); pip refuses this"
+    )
+
+
+def test_requirements_include_diamond_lists_packages_once(tmp_path):
+    # A file included twice from two different files is fine: it is read once, as pip reads it (#603).
+    path = tmp_path / "top.txt"
+    path.write_text("-r left.txt\n-r right.txt\n", encoding="utf-8")
+    (tmp_path / "left.txt").write_text("-r base.txt\nleft==1.0\n", encoding="utf-8")
+    (tmp_path / "right.txt").write_text("-r base.txt\nright==2.0\n", encoding="utf-8")
+    (tmp_path / "base.txt").write_text("base==3.0\n", encoding="utf-8")
+    assert [(p.name, p.version) for p in parse_requirements(path).packages] == [
+        ("base", "3.0"),
+        ("left", "1.0"),
+        ("right", "2.0"),
+    ]
+
+
+def _try_symlink(target: Path, link: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks aren't available here")
+
+
+def test_requirements_symlinked_file_include_reads_from_the_links_folder(tmp_path):
+    # The issue's layout: link/reqs.txt points into real/, and both folders have a base.txt. pip
+    # resolves -r base.txt against the folder of the file as named, so it reads link/base.txt (#604).
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").mkdir()
+    (tmp_path / "real" / "reqs.txt").write_text("-r base.txt\n", encoding="utf-8")
+    (tmp_path / "real" / "base.txt").write_text("psycopg2==2.9.11\n", encoding="utf-8")
+    (tmp_path / "link" / "base.txt").write_text("idna==3.11\n", encoding="utf-8")
+    _try_symlink(Path("../real/reqs.txt"), tmp_path / "link" / "reqs.txt")
+    assert [(p.name, p.version) for p in parse_requirements(tmp_path / "link" / "reqs.txt").packages] == [
+        ("idna", "3.11")
+    ]
+
+
+def test_requirements_symlinked_folder_include_reads_from_the_links_folder(tmp_path):
+    # The requirements file sits in a symlinked folder, and its include climbs out of it: pip joins
+    # -r ../base.txt onto the folder as named (a/link), so it reads a/base.txt, not base.txt (#604).
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "reqs.txt").write_text("-r ../base.txt\n", encoding="utf-8")
+    (tmp_path / "a" / "base.txt").write_text("idna==3.11\n", encoding="utf-8")
+    (tmp_path / "base.txt").write_text("psycopg2==2.9.11\n", encoding="utf-8")
+    _try_symlink(Path("../b"), tmp_path / "a" / "link")
+    assert [(p.name, p.version) for p in parse_requirements(tmp_path / "a" / "link" / "reqs.txt").packages] == [
+        ("idna", "3.11")
+    ]
+
+
+def test_requirements_symlinked_constraints_file_include_reads_from_the_links_folder(tmp_path):
+    # A -c inside a symlinked constraints file resolves against the link's folder too: the constraint
+    # comes from link/base.txt, not real/base.txt (#604).
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").mkdir()
+    (tmp_path / "top.txt").write_text("idna\n-c link/cons.txt\n", encoding="utf-8")
+    (tmp_path / "real" / "cons.txt").write_text("-c base.txt\n", encoding="utf-8")
+    (tmp_path / "real" / "base.txt").write_text("idna==2.0\n", encoding="utf-8")
+    (tmp_path / "link" / "base.txt").write_text("idna==3.11\n", encoding="utf-8")
+    _try_symlink(Path("../real/cons.txt"), tmp_path / "link" / "cons.txt")
+    (pkg,) = parse_requirements(tmp_path / "top.txt").packages
+    assert (pkg.name, pkg.version) == ("idna", "3.11")
+
+
+def test_requirements_symlinked_file_missing_include_names_the_path_pip_would_open(tmp_path):
+    # The link's own folder has no base.txt, so pip fails opening link/base.txt: the error names that
+    # path, not the one the link points into (#604).
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").mkdir()
+    (tmp_path / "real" / "reqs.txt").write_text("-r base.txt\n", encoding="utf-8")
+    (tmp_path / "real" / "base.txt").write_text("psycopg2==2.9.11\n", encoding="utf-8")
+    _try_symlink(Path("../real/reqs.txt"), tmp_path / "link" / "reqs.txt")
+    with pytest.raises(SourceError, match=r"^reqs\.txt:1: -r base\.txt: file not found$") as caught:
+        parse_requirements(tmp_path / "link" / "reqs.txt")
+    # The filename, not str(error): that shows the path's repr, with doubled backslashes on Windows.
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
+    assert Path(caught.value.__cause__.filename) == tmp_path / "link" / "base.txt"
+
+
+def test_requirements_file_reached_by_two_names_lists_packages_once(tmp_path):
+    # The same file included once by its own name and once through a link is still read once: the loop
+    # and "already read" identity is the resolved path, so its packages are listed once (#604).
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").mkdir()
+    path = tmp_path / "top.txt"
+    path.write_text("-r real/base.txt\n-r link/base.txt\n", encoding="utf-8")
+    (tmp_path / "real" / "base.txt").write_text("idna==3.11\n", encoding="utf-8")
+    _try_symlink(Path("../real/base.txt"), tmp_path / "link" / "base.txt")
+    assert [(p.name, p.version) for p in parse_requirements(path).packages] == [("idna", "3.11")]
+
+
+def test_requirements_shared_file_linked_into_two_folders_reads_each_folders_include(tmp_path):
+    # One shared file linked into two service folders, both included from one top file. The shared
+    # file's own line is listed once, but its -r base.txt is another file under each name, and pip
+    # reads both (checked with pip 26.3's parser): neither folder's packages may be dropped (#604).
+    for folder in ("shared", "a", "b"):
+        (tmp_path / folder).mkdir()
+    path = tmp_path / "top.txt"
+    path.write_text("-r a/reqs.txt\n-r b/reqs.txt\n", encoding="utf-8")
+    (tmp_path / "shared" / "reqs.txt").write_text("requests==2.32.5\n-r base.txt\n", encoding="utf-8")
+    (tmp_path / "a" / "base.txt").write_text("idna==3.11\n", encoding="utf-8")
+    (tmp_path / "b" / "base.txt").write_text("six==1.17.0\n", encoding="utf-8")
+    _try_symlink(Path("../shared/reqs.txt"), tmp_path / "a" / "reqs.txt")
+    _try_symlink(Path("../shared/reqs.txt"), tmp_path / "b" / "reqs.txt")
+    assert [(p.name, p.version) for p in parse_requirements(path).packages] == [
+        ("requests", "2.32.5"),
+        ("idna", "3.11"),
+        ("six", "1.17.0"),
+    ]
+
+
+def test_requirements_shared_file_on_the_chain_under_two_names_is_not_a_cycle(tmp_path):
+    # a/reqs.txt and b/reqs.txt are links to one shared file, and a's include leads to b's. The shared
+    # file is then being read under two names at once, but nothing includes itself: pip compares the
+    # names (os.path.abspath), reads on, and installs idna (checked with pip 26.3's parser) (#604).
+    for folder in ("shared", "a", "b"):
+        (tmp_path / folder).mkdir()
+    (tmp_path / "shared" / "reqs.txt").write_text("-r next.txt\n", encoding="utf-8")
+    (tmp_path / "a" / "next.txt").write_text("-r ../b/reqs.txt\n", encoding="utf-8")
+    (tmp_path / "b" / "next.txt").write_text("idna==3.11\n", encoding="utf-8")
+    _try_symlink(Path("../shared/reqs.txt"), tmp_path / "a" / "reqs.txt")
+    _try_symlink(Path("../shared/reqs.txt"), tmp_path / "b" / "reqs.txt")
+    assert [(p.name, p.version) for p in parse_requirements(tmp_path / "a" / "reqs.txt").packages] == [("idna", "3.11")]
+
+
+def test_requirements_include_cycle_through_a_symlink_is_an_error(tmp_path):
+    # A loop through a link is refused, and the chain names the files as they were written (#604).
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").mkdir()
+    path = tmp_path / "a.txt"
+    path.write_text("-r link/b.txt\n", encoding="utf-8")
+    (tmp_path / "real" / "b.txt").write_text("-r ../a.txt\n", encoding="utf-8")
+    _try_symlink(Path("../real/b.txt"), tmp_path / "link" / "b.txt")
+    with pytest.raises(SourceError) as caught:
+        parse_requirements(path)
+    assert str(caught.value) == (
+        "link/b.txt: -r ../a.txt includes a file that is already being read "
+        "(a.txt -> link/b.txt -> a.txt); pip refuses this"
+    )
+
+
+def test_requirements_constraint_inside_constraints_file_stays_a_constraint(tmp_path):
+    path = tmp_path / "a.txt"
+    path.write_text("ranged\n-c cons.txt\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("-c nested.txt\n", encoding="utf-8")
+    (tmp_path / "nested.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert pkg.version == "1.9"
+
+
+def test_requirements_requirement_inside_requirement_file_is_unchanged(tmp_path):
+    path = tmp_path / "a.txt"
+    path.write_text("-r base.txt\n", encoding="utf-8")
+    (tmp_path / "base.txt").write_text("-r extra.txt\n", encoding="utf-8")
+    (tmp_path / "extra.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    assert [(p.name, p.version) for p in parse_requirements(path).packages] == [("purewheel", "3.1")]
+
+
+def test_requirements_file_read_as_constraint_and_requirement_gives_both(tmp_path):
+    # The seen/stack bookkeeping is per kind of file, so a file read once as constraints and once
+    # as requirements gives both (#602).
+    path = tmp_path / "a.txt"
+    path.write_text("-c shared.txt\n-r shared.txt\n", encoding="utf-8")
+    (tmp_path / "shared.txt").write_text("ranged==1.9\npurewheel==3.1\n", encoding="utf-8")
+    assert [(p.name, p.version) for p in parse_requirements(path).packages] == [
+        ("ranged", "1.9"),
+        ("purewheel", "3.1"),
+    ]
 
 
 def test_requirements_marker_constraint_is_an_error(tmp_path):
@@ -269,6 +695,130 @@ def test_requirements_url_and_env_var_constraints_are_skipped(tmp_path):
     assert [(p.name, p.version, p.spec, p.error) for p in parse_requirements(path).packages] == [
         ("ranged", None, None, None)
     ]
+
+
+@pytest.mark.parametrize(
+    "line,target",
+    [
+        ("--pre -r base.txt", "base.txt"),
+        ("--pre --requirement=base.txt", "base.txt"),
+        ("--pre --requirement base.txt", "base.txt"),
+        ("--pre -rbase.txt", "base.txt"),
+        ('-r "dir with space/base.txt"', "dir with space/base.txt"),
+        ("-r 'dir with space/base.txt'", "dir with space/base.txt"),
+    ],
+)
+def test_requirements_include_after_other_options(tmp_path, line, target):
+    # pip shlex-splits a line of options and reads every option on it, not only the first
+    (tmp_path / target).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / target).write_text("purewheel==3.1\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{line}\nfastlib==2.0.0\n", encoding="utf-8")
+    packages = parse_requirements(path).packages
+    assert [(p.name, p.version, p.origin) for p in packages] == [
+        ("purewheel", "3.1", "base.txt"),
+        ("fastlib", "2.0.0", "requirements.txt"),
+    ]
+
+
+@pytest.mark.parametrize("line", ["--pre -c pins.txt", "--pre --constraint=pins.txt", "--pre -cpins.txt"])
+def test_requirements_constraint_after_other_options(tmp_path, line):
+    (tmp_path / "pins.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"ranged\n{line}\n", encoding="utf-8")
+    assert [(p.name, p.version) for p in parse_requirements(path).packages] == [("ranged", "1.9")]
+
+
+@pytest.mark.parametrize(
+    "line,names",
+    [
+        # optparse collects every -r and -c, and pip follows only the first -r, or the first -c if there's no -r
+        ("-r a.txt -r b.txt", ["purewheel"]),
+        ("-c pins.txt -r a.txt", ["purewheel"]),
+    ],
+)
+def test_requirements_line_with_several_includes_reads_what_pip_reads(tmp_path, line, names):
+    (tmp_path / "a.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("fastlib==2.0.0\n", encoding="utf-8")
+    (tmp_path / "pins.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{line}\n", encoding="utf-8")
+    assert [p.name for p in parse_requirements(path).packages] == names
+
+
+def test_requirements_line_with_two_constraints_reads_only_the_first(tmp_path):
+    (tmp_path / "pins.txt").write_text("ranged>=1\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text("ranged\n-c pins.txt -c b.txt\n", encoding="utf-8")
+    (ranged,) = parse_requirements(path).packages
+    assert (ranged.version, ranged.spec) == (None, ">=1")
+
+
+def test_requirements_editable_line_follows_no_include(tmp_path):
+    # pip reads `-e PATH -r f` as an editable requirement, and an -r on a requirement line isn't followed
+    (tmp_path / "a.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text("-e ./localpkg -r a.txt\n", encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert pkg.skip == "editable"
+
+
+def test_requirements_format_option_before_include_still_applies(tmp_path):
+    (tmp_path / "base.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text("--no-binary :all: -r base.txt\n", encoding="utf-8")
+    (purewheel,) = parse_requirements(path).packages
+    assert (purewheel.no_binary, purewheel.only_binary) == (True, False)
+
+
+@pytest.mark.parametrize(
+    "line,names",
+    [
+        # optparse takes the token after an option with a value as that value, even one starting with -
+        ("--no-binary -r base.txt", ["fastlib"]),
+        ("--extra -r base.txt", ["fastlib"]),  # an abbreviation of --extra-index-url
+        ("-C -r base.txt", ["fastlib"]),  # -C is short for --config-settings
+        ("-i -cpins.txt -r base.txt", ["purewheel", "fastlib"]),
+        ("--pre -r base.txt", ["purewheel", "fastlib"]),  # --pre is an option of its own, not short for --prefer-binary
+    ],
+)
+def test_requirements_option_values_are_not_read_as_options(tmp_path, line, names):
+    (tmp_path / "base.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{line}\nfastlib==2.0.0\n", encoding="utf-8")
+    assert [p.name for p in parse_requirements(path).packages] == names
+
+
+def test_requirements_format_option_after_include_still_applies(tmp_path):
+    # optparse applies every option on the line before pip reads the include
+    (tmp_path / "base.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text("-r base.txt --no-binary :all:\n", encoding="utf-8")
+    (purewheel,) = parse_requirements(path).packages
+    assert (purewheel.no_binary, purewheel.only_binary) == (True, False)
+
+
+@pytest.mark.parametrize(
+    "line,message",
+    [
+        ("-r 'unclosed", "pip can't split this line"),
+        ("--pre -r", "-r needs a file name"),
+        ("--constraint=", "--constraint needs a file name"),
+        # pip's answer would depend on an option wheelgap doesn't read, so it's refused rather than guessed
+        ("-r a.txt --req b.txt", "on a line with an abbreviated -r or -c"),
+        ("-c a.txt --req b.txt", "on a line with an abbreviated -r or -c"),
+        ("-r a.txt -e ./localpkg", "on a line with an editable"),
+        # the token after an abbreviated include is its value, so the -C here doesn't hide the -r that pip follows
+        ("--cons -C -r a.txt", "on a line with an abbreviated -r or -c"),
+    ],
+)
+def test_requirements_unreadable_option_line_is_an_error(tmp_path, line, message):
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{line}\nfastlib==2.0.0\n", encoding="utf-8")
+    with pytest.raises(SourceError, match="requirements.txt: ") as raised:
+        parse_requirements(path)
+    assert message in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -1064,6 +1614,97 @@ def test_no_lockfile_without_project_table_has_no_pyproject_hint(tmp_path):
     assert "pyproject.toml`" not in str(e.value)
 
 
+GROUPS_ONLY = '[dependency-groups]\ntest = ["pytest", "numpy"]\nlint = ["ruff"]\n'
+
+
+def test_no_lockfile_groups_only_suggests_sorted_group_selection(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(GROUPS_ONLY, encoding="utf-8")
+    with pytest.raises(SourceError) as e:
+        find_lockfile(tmp_path)
+    message = str(e.value)
+    assert f"wheelgap {tmp_path / 'pyproject.toml'} --group NAME` (groups: lint, test)." in message
+    assert message.endswith("Pass a file, or package names like `wheelgap numpy psycopg2`.")
+
+
+@pytest.mark.parametrize(
+    "contents",
+    ["[dependency-groups]\n", "[project]\nname = 'x'\n[dependency-groups]\n", "[project]\nname = 'x'\n" + GROUPS_ONLY],
+    ids=["no-groups", "project-and-no-groups", "project-and-groups"],
+)
+def test_no_lockfile_empty_groups_or_project_keeps_existing_hint_rules(tmp_path, contents):
+    (tmp_path / "pyproject.toml").write_text(contents, encoding="utf-8")
+    with pytest.raises(SourceError) as e:
+        find_lockfile(tmp_path)
+    message = str(e.value)
+    assert "--group" not in message
+    if "[project]" in contents:
+        assert f"wheelgap {tmp_path / 'pyproject.toml'}`" in message
+    else:
+        assert "pyproject.toml`" not in message
+
+
+@pytest.mark.parametrize(
+    "contents,beside",
+    [
+        (GROUPS_ONLY, "setup.py"),
+        (GROUPS_ONLY, "setup.cfg"),
+        ('[build-system]\nrequires = ["setuptools"]\nbuild-backend = "setuptools.build_meta"\n' + GROUPS_ONLY, None),
+        ('[tool.flit.metadata]\nmodule = "mypkg"\nrequires = ["numpy"]\n' + GROUPS_ONLY, None),
+        ('[tool.pdm]\ndependencies = ["numpy"]\n' + GROUPS_ONLY, None),
+        ('[tool.poetry.dependencies]\npython = "^3.10"\nnumpy = "*"\n' + GROUPS_ONLY, None),
+        ('project = "invalid"\n' + GROUPS_ONLY, None),
+    ],
+    ids=["setup-py", "setup-cfg", "build-system", "flit-metadata", "pdm-dependencies", "poetry", "project-not-a-table"],
+)
+def test_no_lockfile_groups_only_in_a_buildable_project_has_no_group_hint(tmp_path, contents, beside):
+    # `wheelgap pyproject.toml --group NAME` refuses these (the project's own dependencies are outside [project]),
+    # so the hint mustn't send anyone there.
+    (tmp_path / "pyproject.toml").write_text(contents, encoding="utf-8")
+    if beside:
+        (tmp_path / beside).write_text("", encoding="utf-8")
+    with pytest.raises(SourceError, match="no lockfile found") as e:
+        find_lockfile(tmp_path)
+    assert "pyproject.toml`" not in str(e.value) and "--group" not in str(e.value)
+
+
+def test_no_lockfile_group_hint_repeats_only_valid_group_names(tmp_path):
+    # A quoted TOML key can hold anything: line breaks, escape codes, a workflow command, a sentence.
+    (tmp_path / "pyproject.toml").write_text(
+        "[dependency-groups]\n"
+        'Type_Check = []\n"lint.fast" = []\ndocs = []\n'
+        '"a\\n::error::b" = []\n"\\u001b[2J" = []\n"run this instead" = []\n"-x" = []\n"caf\\u00e9" = []\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError) as e:
+        find_lockfile(tmp_path)
+    assert str(e.value).isprintable()
+    assert "(groups: docs, lint-fast, type-check). Pass a file" in str(e.value)
+
+
+def test_no_lockfile_groups_that_collide_once_normalized_have_no_hint(tmp_path):
+    # `--group` refuses this file whichever group is asked for, so there is no command to suggest.
+    (tmp_path / "pyproject.toml").write_text(
+        '[dependency-groups]\nType_Check = []\n"type.check" = []\ndocs = []\n', encoding="utf-8"
+    )
+    with pytest.raises(SourceError, match="no lockfile found") as e:
+        find_lockfile(tmp_path)
+    assert "pyproject.toml`" not in str(e.value) and "--group" not in str(e.value)
+
+
+def test_no_lockfile_groups_with_no_valid_name_has_no_hint(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[dependency-groups]\n"a\\n::error::b" = ["numpy"]\n', encoding="utf-8")
+    with pytest.raises(SourceError, match="no lockfile found") as e:
+        find_lockfile(tmp_path)
+    assert "pyproject.toml`" not in str(e.value) and "::error::" not in str(e.value)
+
+
+def test_no_lockfile_unreadable_pyproject_has_no_hint(tmp_path):
+    (tmp_path / "pyproject.toml").write_bytes(b"[dependency-groups]\xff")
+    with pytest.raises(SourceError) as e:
+        find_lockfile(tmp_path)
+    assert "pyproject.toml`" not in str(e.value)
+
+
 def test_poetry_group_selection_keeps_markers_per_group(tmp_path):
     (tmp_path / "poetry.lock").write_text(
         '[[package]]\nname = "colorama"\nversion = "0.4.6"\ngroups = ["main", "dev"]\n'
@@ -1718,6 +2359,369 @@ def test_requirements_binary_format_control(tmp_path, lines, expected):
     assert {name: (pkgs[name].no_binary, pkgs[name].only_binary) for name in expected} == expected
 
 
+@pytest.mark.parametrize(
+    "lines, expected",
+    [
+        # Each row is what pip 26.3 does (pip install --dry-run -r FILE): the option counts for the whole install,
+        # like the same option on a line of its own, wherever the requirement that carries it is.
+        ("fastlib>=2 --no-binary fastlib\n", {"fastlib": (True, False)}),
+        (
+            "fastlib>=2 --no-binary fastlib,purewheel\npurewheel==3.1\n",
+            {"fastlib": (True, False), "purewheel": (True, False)},
+        ),
+        ("purewheel==3.1\nfastlib==2.0.0 --no-binary :all:\n", {"fastlib": (True, False), "purewheel": (True, False)}),
+        (
+            "fastlib==2.0.0 --no-binary purewheel\npurewheel==3.1\n",
+            {"fastlib": (False, False), "purewheel": (True, False)},
+        ),
+        ("fastlib==2.0.0 --only-binary=fastlib\n", {"fastlib": (False, True)}),
+        ("fastlib==2.0.0 --no-binary=fastlib --only-binary=fastlib\n", {"fastlib": (False, True)}),
+        ("--only-binary :all:\nfastlib==2.0.0 --no-binary fastlib\n", {"fastlib": (True, False)}),
+        ("fastlib==2.0.0 ; python_version >= '3.8' --no-binary fastlib\n", {"fastlib": (True, False)}),
+        ("fastlib==2.0.0 --hash=sha256:aa --no-binary fastlib --hash sha256:bb\n", {"fastlib": (True, False)}),
+        ("fastlib==2.0.0 \\\n    --no-binary fastlib\n", {"fastlib": (True, False)}),
+        ("fastlib==2.0.0 --config-settings a=b -C c=d -Ce=f --config-setting=g=h\n", {"fastlib": (False, False)}),
+    ],
+)
+def test_requirements_format_options_after_a_requirement(tmp_path, lines, expected):
+    req = tmp_path / "requirements.txt"
+    req.write_text(lines, encoding="utf-8")
+    source = parse_requirements(req)
+    pkgs = by_name(source)
+    assert {name: (pkgs[name].no_binary, pkgs[name].only_binary) for name in expected} == expected
+    assert all(not p.skip and not p.error for p in source.packages)
+    assert all(" -" not in spec for spec in source.specs)  # --deps resolves the requirement, not its options
+
+
+def test_requirements_options_after_a_requirement_keep_its_pin_and_hash_mode(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("fastlib==2.0.0 --no-binary fastlib --hash=sha256:aa\npurewheel>=3 --only-binary purewheel\n")
+    source = parse_requirements(req)
+    assert [(p.name, p.version, p.spec) for p in source.packages] == [
+        ("fastlib", "2.0.0", None),
+        ("purewheel", None, ">=3"),
+    ]
+    assert source.compiled and source.specs == ["fastlib==2.0.0", "purewheel>=3"]
+    assert source.packages[0].hashes == frozenset({"aa"})
+    assert source.packages[1].hashes == frozenset()
+
+
+def test_requirements_hashes_preserved_for_both_spellings_and_continuation(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "pkg_eq==1.0 --hash=sha256:1111\n"
+        "pkg_space==2.0 --hash sha256:2222\n"
+        "pkg_continued==3.0 \\\n"
+        "    --hash=sha256:3333 \\\n"
+        "    --hash sha256:4444\n"
+    )
+    source = parse_requirements(req)
+    assert [(p.name, p.version, p.hashes) for p in source.packages] == [
+        ("pkg_eq", "1.0", frozenset({"1111"})),
+        ("pkg_space", "2.0", frozenset({"2222"})),
+        ("pkg_continued", "3.0", frozenset({"3333", "4444"})),
+    ]
+
+
+def test_requirements_hashes_keep_sha256_only_lowercased(tmp_path):
+    # pip lowercases the hashes it's given, and only a sha256 can match a file on PyPI, which gives no other digest
+    # (pip 26.3 takes the sdist for `--hash=sha256:<sdist> --hash=sha512:<wheel>`). A line with only sha384/sha512
+    # hashes is read as without --hash: pip checks its pick after the download, which wheelgap can't do.
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        f"upper==1.0 --hash=sha256:{'AB' * 32}\n"
+        f"other==1.0 --hash=sha512:{'cd' * 64} --hash=sha384:{'cd' * 48}\n"
+        f"mixed==1.0 --hash=sha512:{'ef' * 64} --hash=sha256:{'12' * 32}\n"
+    )
+    assert [p.hashes for p in parse_requirements(req).packages] == [
+        frozenset({"ab" * 32}),
+        frozenset(),
+        frozenset({"12" * 32}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "line, ignored",
+    [
+        # Each row is what pip 26.3 does (pip install --dry-run -r FILE): it parses the option and drops it, so the
+        # requirement is installed from the same index as without it, at the same version.
+        ("fastlib==2.0.0 -f https://example.invalid/wheels.html", ["-f"]),
+        ("fastlib==2.0.0 -fhttps://example.invalid/wheels.html", ["-f"]),
+        ("fastlib==2.0.0 --find-links ./wheels", ["--find-links"]),
+        ("fastlib==2.0.0 --find-links=./wheels", ["--find-links"]),
+        ("fastlib==2.0.0 --find ./wheels", ["--find-links"]),  # optparse takes an unambiguous prefix
+        ("fastlib==2.0.0 \\\n    -f ./wheels", ["-f"]),
+        ("fastlib==2.0.0 -i https://example.invalid/simple", ["-i"]),
+        ("fastlib==2.0.0 --index-url=https://example.invalid/simple", ["--index-url"]),
+        ("fastlib==2.0.0 --pypi-url https://example.invalid/simple", ["--pypi-url"]),
+        ("fastlib==2.0.0 --extra-index-url https://example.invalid/simple", ["--extra-index-url"]),
+        ("fastlib==2.0.0 --no-index", ["--no-index"]),
+        ("fastlib==2.0.0 --pre", ["--pre"]),
+        ("fastlib==2.0.0 --prefer-binary", ["--prefer-binary"]),
+        ("fastlib==2.0.0 -r more.txt", ["-r"]),  # never read, so a missing file is no error either
+        ("fastlib==2.0.0 --requirement=more.txt", ["--requirement"]),
+        ("fastlib==2.0.0 -c cons.txt", ["-c"]),
+        ("fastlib==2.0.0 --trusted-host example.invalid", ["--trusted-host"]),
+        ("fastlib==2.0.0 --require-hashes", ["--require-hashes"]),
+        ("fastlib==2.0.0 --no-require-hashes", ["--no-require-hashes"]),
+        ("fastlib==2.0.0 -f -r", ["-f"]),  # -r is -f's value: optparse takes the next word, whatever it is
+        ("fastlib==2.0.0 --hash=sha256:aa stray", ["words that aren't options"]),
+        ("fastlib==2.0.0 - -- -f x", ["words that aren't options"]),
+        ("fastlib==2.0.0 -f x --pre -f y --no-binary :none:", ["-f", "--pre"]),
+        # pip turns the feature on for the run, and no feature changes which file it picks: no note.
+        ("fastlib==2.0.0 --use-feature fast-deps", []),
+    ],
+)
+def test_requirements_options_pip_ignores_after_a_requirement(tmp_path, line, ignored):
+    req = tmp_path / "requirements.txt"
+    req.write_text(f"purewheel==3.1\n{line}\n", encoding="utf-8")
+    source = parse_requirements(req)
+    assert [(p.name, p.version, p.skip, p.no_binary, p.only_binary) for p in source.packages] == [
+        ("purewheel", "3.1", None, False, False),
+        ("fastlib", "2.0.0", None, False, False),
+    ]
+    assert source.specs == ["purewheel==3.1", "fastlib==2.0.0"]
+    assert source.ignored_options == [
+        f"requirements.txt:2: pip ignores {option} after a requirement" for option in ignored
+    ]
+
+
+def test_requirements_format_option_is_read_only_where_pip_reads_it(tmp_path):
+    # pip 26.3: `-f --only-binary` makes "--only-binary" -f's value and sets "nowheels" aside, so only fastlib is
+    # binary-only; a -C value that looks like an option is a config setting.
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "fastlib==2.0.0 --only-binary fastlib -f --only-binary nowheels\n"
+        "purewheel==3.1 -C --no-binary=purewheel\nnowheels==0.9\n",
+        encoding="utf-8",
+    )
+    source = parse_requirements(req)
+    assert [(p.name, p.no_binary, p.only_binary) for p in source.packages] == [
+        ("fastlib", False, True),
+        ("purewheel", False, False),
+        ("nowheels", False, False),
+    ]
+
+
+def test_requirements_constraints_after_a_requirement_are_not_read(tmp_path):
+    # pip 26.3 installs the newest release for `fastlib -c cons.txt` and never opens cons.txt.
+    (tmp_path / "cons.txt").write_text("fastlib==1.0\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text("fastlib -c cons.txt\npurewheel -r more.txt\n", encoding="utf-8")
+    source = parse_requirements(req)
+    assert [(p.name, p.version, p.spec) for p in source.packages] == [
+        ("fastlib", None, None),
+        ("purewheel", None, None),
+    ]
+    assert not source.constraint_specs
+    assert source.ignored_options == [
+        "requirements.txt:1: pip ignores -c after a requirement",
+        "requirements.txt:2: pip ignores -r after a requirement",
+    ]
+
+
+def test_requirements_ignored_option_note_is_once_per_file_and_option(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "base.txt").write_text("purewheel==3.1 -f ./w\nnowheels==0.9 -f ./w --pre\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "fastlib==2.0.0 -f ./w\n-r sub/base.txt\nfastlib==2.0.0 --find-links ./w\n-r sub/base.txt\n", encoding="utf-8"
+    )
+    assert parse_requirements(req).ignored_options == [
+        "requirements.txt:1: pip ignores -f after a requirement",
+        "sub/base.txt:1: pip ignores -f after a requirement",
+        "sub/base.txt:2: pip ignores --pre after a requirement",
+    ]
+
+
+def test_conda_env_pip_list_ignored_option_note(tmp_path):
+    env = tmp_path / "environment.yml"
+    env.write_text("dependencies:\n  - pip:\n    - purewheel==3.1 -f ./wheels\n", encoding="utf-8")
+    source = sources.load_file(env)
+    assert [(p.name, p.version) for p in source.packages] == [("purewheel", "3.1")]
+    assert source.ignored_options == ["environment.yml: pip ignores -f after a requirement"]
+
+
+def _release_control(tmp_path, files):
+    for name, text in files.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    source = parse_requirements(tmp_path / "requirements.txt")
+    return source, {p.key: p.prereleases for p in source.packages}
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        # pip 26.3 applies --pre to the whole install, wherever its line is: before or after the requirement, in an
+        # included -r file or a -c file (#634). It never changes a package with no release control.
+        ({"requirements.txt": "fastlib>=2\n"}, {"fastlib": None}),
+        ({"requirements.txt": "--pre\nfastlib>=2\n"}, {"fastlib": True}),
+        ({"requirements.txt": "fastlib>=2\n--pre\n"}, {"fastlib": True}),
+        ({"requirements.txt": "--trusted-host x --pre\nfastlib>=2\n"}, {"fastlib": True}),  # after another option
+        ({"requirements.txt": "-r base.txt\nfastlib>=2\n", "base.txt": "--pre\n"}, {"fastlib": True}),
+        ({"requirements.txt": "-c c.txt\nfastlib>=2\n", "c.txt": "--pre\n"}, {"fastlib": True}),
+        # On a line with -r or -c, pip reads the file and never applies --pre (handle_option_line isn't called for
+        # it): `--pre -r inc.txt` installs demo 1.0, not 2.0rc1.
+        ({"requirements.txt": "--pre -r base.txt\n", "base.txt": "fastlib>=2\n"}, {"fastlib": None}),
+        ({"requirements.txt": "-r base.txt --pre\n", "base.txt": "fastlib>=2\n"}, {"fastlib": None}),
+        # After a requirement pip ignores --pre too (and wheelgap notes that).
+        ({"requirements.txt": "fastlib>=2 --pre\n"}, {"fastlib": None}),
+        # --all-releases and --only-final count on any line pip parses, a -r line and a requirement's too: their
+        # parser callbacks set them. A package named wins over :all:, in either set.
+        ({"requirements.txt": "--all-releases fastlib -r base.txt\n", "base.txt": "fastlib>=2\n"}, {"fastlib": True}),
+        ({"requirements.txt": "fastlib>=2 --all-releases fastlib\nranged\n"}, {"fastlib": True, "ranged": None}),
+        ({"requirements.txt": "--all :all:\nfastlib>=2\n"}, {"fastlib": True}),  # an abbreviation
+        ({"requirements.txt": "--only-final :all:\nfastlib>=2\n"}, {"fastlib": False}),
+        ({"requirements.txt": "--only-final fastlib\n--pre\nfastlib>=2\nranged\n"}, {"fastlib": False, "ranged": True}),
+        ({"requirements.txt": "--pre\n--only-final fastlib\nfastlib\n"}, {"fastlib": False}),
+        ({"requirements.txt": "--all-releases :all:,fastlib\n--only-final fastlib\nfastlib\n"}, {"fastlib": False}),
+        (
+            {"requirements.txt": "--only-final :all:,:none:,ranged\nranged\nfastlib\n"},
+            {"ranged": False, "fastlib": None},
+        ),
+        ({"requirements.txt": "--only-final :all:\n--all-releases :all:\nfastlib\n"}, {"fastlib": True}),
+    ],
+)
+def test_requirements_release_control_as_pip_reads_it(tmp_path, files, expected):
+    # Each case's answer is what pip 26.3 installs for the same lines (pip install --dry-run against local wheels).
+    _, prereleases = _release_control(tmp_path, files)
+    assert prereleases == expected
+
+
+@pytest.mark.parametrize(
+    ("files", "where"),
+    [
+        ({"requirements.txt": "--prefer-binary\nfastlib>=2\n"}, "requirements.txt:1"),
+        ({"requirements.txt": "fastlib>=2\n--pref\n"}, "requirements.txt:2"),
+        ({"requirements.txt": "-r base.txt\n", "base.txt": "fastlib>=2\n--prefer-binary\n"}, "base.txt:2"),
+        # pip ignores it on a -r line and after a requirement.
+        ({"requirements.txt": "--prefer-binary -r base.txt\n", "base.txt": "fastlib>=2\n"}, None),
+        ({"requirements.txt": "fastlib>=2 --prefer-binary\n"}, None),
+    ],
+)
+def test_requirements_prefer_binary_is_recorded(tmp_path, files, where):
+    source, _ = _release_control(tmp_path, files)
+    assert source.format_control.prefer_binary == where
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [
+        # pip 26.3 refuses both lines: "--all-releases option requires 1 argument", and from ReleaseControl,
+        # "--all-releases / --only-final option requires 1 argument."
+        ("--only-final", "requirements.txt:1: pip refuses this line: --only-final option requires 1 argument"),
+        ("--only-final --pre", "requirements.txt:1: pip refuses this line: --all-releases / --only-final option"),
+    ],
+)
+def test_requirements_release_option_line_pip_refuses(tmp_path, line, message):
+    with pytest.raises(SourceError, match=re.escape(message)):
+        _release_control(tmp_path, {"requirements.txt": f"{line}\nfastlib>=2\n"})
+
+
+def test_requirements_only_final_refuses_a_pinned_pre_release(tmp_path):
+    # pip 26.3 with `--only-final :all:` and `demo==2.0rc1`: "Could not find a final version that satisfies".
+    source, _ = _release_control(tmp_path, {"requirements.txt": "--only-final :all:\nprelib==2.0rc1\nfastlib==2.0.0\n"})
+    errors = {p.key: p.error for p in source.packages}
+    assert errors["prelib"] == (
+        "pip installs only final releases of prelib here (--only-final), so it finds no 2.0rc1 (pip refuses this)"
+    )
+    assert errors["fastlib"] is None
+
+
+@pytest.mark.parametrize(
+    ("files", "blocker"),
+    [
+        ({"requirements.txt": "-r base.txt\n", "base.txt": "--pre\nfastlib>=2\n"}, "base.txt:1 sets --pre"),
+        ({"requirements.txt": "fastlib>=2 --only-final fastlib\n"}, "requirements.txt:1 sets --only-final"),
+        ({"requirements.txt": "--prefer-binary\nfastlib>=2\n"}, "requirements.txt:1 sets --prefer-binary"),
+    ],
+)
+def test_requirements_release_options_block_deps(tmp_path, files, blocker):
+    source, _ = _release_control(tmp_path, files)
+    assert source.deps_blockers == [f"{blocker}, which changes the releases pip picks for dependencies"]
+
+
+@pytest.mark.parametrize(
+    "line, message",
+    [
+        # pip 26.3 refuses these ("Invalid requirement: ..." and optparse's own words).
+        ("fastlib>=2 --bogus-option x", "requirements.txt:2: pip refuses this line: no such option: --bogus-option"),
+        ("fastlib>=2 --global-option=x", "requirements.txt:2: pip refuses this line: no such option: --global-option"),
+        ("fastlib>=2 --src x", "requirements.txt:2: pip refuses this line: no such option: --src"),
+        ("fastlib>=2 -x", "requirements.txt:2: pip refuses this line: no such option: -x"),
+        (
+            "fastlib>=2 --no x",
+            "requirements.txt:2: pip refuses this line: ambiguous option: --no (--no-binary, --no-index, "
+            "--no-require-hashes?)",
+        ),
+        (
+            "fastlib>=2 --pr",
+            "requirements.txt:2: pip refuses this line: ambiguous option: --pr (--pre, --prefer-binary?)",
+        ),
+        ("fastlib>=2 --no-binary", "requirements.txt:2: pip refuses this line: --no-binary option requires 1 argument"),
+        ("fastlib>=2 --hash", "requirements.txt:2: pip refuses this line: --hash option requires 1 argument"),
+        ("fastlib>=2 -f", "requirements.txt:2: pip refuses this line: -f option requires 1 argument"),
+        ("fastlib>=2 --trusted-host", "requirements.txt:2: pip refuses this line: --trusted-host option requires 1"),
+        ("fastlib>=2 --pre=yes", "requirements.txt:2: pip refuses this line: --pre option does not take a value"),
+        (
+            "fastlib>=2 --use-feature nope",
+            "requirements.txt:2: pip refuses this line: option --use-feature: invalid choice: 'nope'",
+        ),
+        ("fastlib>=2 --no-binary 'fastlib", "requirements.txt:2: pip can't split this line (an unclosed quote?)"),
+        # pip's parser callbacks refuse these values (pip 26.3 ran).
+        ("fastlib>=2 --no-binary --pre", "requirements.txt:2: pip refuses this line: --no-binary / --only-binary"),
+        ("fastlib>=2 --hash=abc", "requirements.txt:2: pip refuses this line: Arguments to --hash must be a hash"),
+        ("fastlib>=2 --hash=md5:abc", "requirements.txt:2: pip refuses this line: Allowed hash algorithms for --hash"),
+        ("fastlib>=2 -C foo", "requirements.txt:2: pip refuses this line: Arguments to -C must be of the form KEY=VAL"),
+        # pip makes the requirement itself editable, and refuses a name: "fastlib>=2 is not a valid editable
+        # requirement".
+        ("fastlib>=2 -e .", "requirements.txt:2: pip reads -e after a requirement as making that requirement"),
+        (
+            "fastlib>=2 --editable=.",
+            "requirements.txt:2: pip reads --editable after a requirement as making that requirement",
+        ),
+        # pip's ReleaseControl callback refuses a value that starts with "-" (pip 26.3 ran).
+        ("fastlib>=2 --only-final --pre", "requirements.txt:2: pip refuses this line: --all-releases / --only-final"),
+        ("fastlib>=2 --all-releases", "requirements.txt:2: pip refuses this line: --all-releases option requires 1"),
+    ],
+)
+def test_requirements_other_options_after_a_requirement_are_refused(tmp_path, line, message):
+    req = tmp_path / "requirements.txt"
+    req.write_text(f"purewheel==3.1\n{line}\n", encoding="utf-8")
+    with pytest.raises(SourceError, match=re.escape(message)):
+        parse_requirements(req)
+
+
+@pytest.mark.parametrize(
+    "top, message",
+    [
+        ("purewheel==3.1\n-r missing.txt\n", "requirements.txt:2: -r missing.txt: file not found"),
+        ("--requirement=missing.txt\n", "requirements.txt:1: --requirement=missing.txt: file not found"),
+        ("# pins\n\n-c missing.txt\npurewheel\n", "requirements.txt:3: -c missing.txt: file not found"),
+        (
+            "purewheel==3.1 \\\n  --hash=sha256:aa\n-r sub/missing.txt\n",
+            "requirements.txt:3: -r sub/missing.txt: file not found",
+        ),
+        ("-r sub/next.txt\n", "sub/next.txt:2: -r gone.txt: file not found"),  # the file that has the line
+        ("-c sub/cons.txt\n", "sub/cons.txt:1: -r gone.txt: file not found"),
+        ("-r sub\n", "requirements.txt:1: -r sub: "),  # a folder: the system's own words (pip: "Is a directory")
+    ],
+)
+def test_requirements_include_that_cannot_be_read_names_the_file_and_line(tmp_path, top, message):
+    # pip stops too ("Could not open requirements file"); before, this was a bare "[Errno 2] No such file ...".
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "next.txt").write_text("purewheel==3.1\n-r gone.txt\n", encoding="utf-8")
+    (tmp_path / "sub" / "cons.txt").write_text("-r gone.txt\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text(top, encoding="utf-8")
+    with pytest.raises(SourceError) as caught:
+        parse_requirements(req)
+    assert str(caught.value).startswith(message) and "Errno" not in str(caught.value)
+    assert isinstance(caught.value.__cause__, OSError)
+    if "file not found" in message:
+        assert str(caught.value) == message
+
+
 def test_requirements_binary_format_control_with_includes(tmp_path):
     (tmp_path / "base.txt").write_text("--no-binary :all:\npurewheel==3.1\n", encoding="utf-8")
     (tmp_path / "override.txt").write_text("--only-binary purewheel\n", encoding="utf-8")
@@ -1756,7 +2760,7 @@ def test_requirements_binary_format_control_reapplied_on_repeated_includes(tmp_p
         ("--only-b :all:", (False, True)),
         ("--o=:all:", (False, True)),
         ("--no- :all:", (False, False)),  # --no-index too: pip refuses it
-        ("--only-final", (False, False)),
+        ("--only-final :all:", (False, False)),  # not --only-binary (a bare --only-final is refused, as pip does)
     ],
 )
 def test_requirements_binary_options_abbreviated(tmp_path, line, expected):
@@ -1837,3 +2841,19 @@ def test_uv_build_policy_rejects_a_tool_key_that_isnt_a_table(tmp_path):
     (tmp_path / "pyproject.toml").write_text('tool = "uv"\n', encoding="utf-8")
     with pytest.raises(SourceError, match=r"\[tool\] must be a table"):
         load_inputs([str(tmp_path)])
+
+
+def test_requirements_option_after_a_requirement_counts_each_time_the_file_is_read(tmp_path):
+    # pip 26.3 reads b.txt twice, so its --no-binary comes after the --only-binary line: pip takes the sdist.
+    (tmp_path / "b.txt").write_text("fastlib==2.0.0 --no-binary fastlib\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("-r b.txt\n--only-binary fastlib\n-r b.txt\n", encoding="utf-8")
+    pkgs = by_name(parse_requirements(tmp_path / "requirements.txt"))
+    assert (pkgs["fastlib"].no_binary, pkgs["fastlib"].only_binary) == (True, False)
+
+
+def test_requirements_tab_before_an_option_is_one_requirement_as_in_pip(tmp_path):
+    # pip splits at single spaces: "fastlib==2.0.0<TAB>--no-binary" is one word, and an invalid requirement.
+    req = tmp_path / "requirements.txt"
+    req.write_text("fastlib==2.0.0\t--no-binary fastlib\n", encoding="utf-8")
+    with pytest.raises(SourceError, match="can't parse requirement"):
+        parse_requirements(req)

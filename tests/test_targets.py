@@ -476,12 +476,14 @@ def test_linux_i686_takes_legacy_manylinux():
     assert not accepts(t("linux-x86_64"), "x-1-cp313-cp313-manylinux_2_17_i686.whl")
 
 
-def test_plain_linux_arch_wheels_count_on_glibc_only():
+def test_plain_linux_arch_wheels_count_on_every_linux():
     # PyPI accepts linux_armv7l uploads for the Raspberry Pi (grpcio ships them), and pip installs them.
     assert accepts(t("linux-armv7l"), "grpcio-1.85.1-cp313-cp313-linux_armv7l.whl")
     assert not accepts(t("linux-aarch64"), "grpcio-1.85.1-cp313-cp313-linux_armv7l.whl")
-    # They're glibc builds, so they don't count on Alpine (pip would take them, then fail to load them).
-    assert not accepts(t("musl-armv7l"), "grpcio-1.85.1-cp313-cp313-linux_armv7l.whl")
+    # pip and uv take them on Alpine too (whether a glibc build then loads there is another question).
+    assert accepts(t("musl-armv7l"), "grpcio-1.85.1-cp313-cp313-linux_armv7l.whl")
+    assert not accepts(t("musl-aarch64"), "grpcio-1.85.1-cp313-cp313-linux_armv7l.whl")
+    assert t("musl-x86_64").platform_tags()[-1] == "linux_x86_64"
 
 
 def test_ios_targets():
@@ -545,3 +547,24 @@ def test_mobile_versions_and_errors():
         build_targets(["3.13"], ["ios"], ios="abc")
     with pytest.raises(TargetError, match="iOS 11.0 is too old"):
         build_targets(["3.13"], ["ios"], ios="11.0")
+
+
+def test_libc_versions_require_minor_and_valid_major():
+    from wheelgap.targets import parse_version_pair
+
+    with pytest.raises(TargetError, match=r"glibc version '2' needs a minor version too \(expected e\.g\. 2\.36\)"):
+        parse_version_pair("2", "glibc")
+    for spec in ("3.1", "1.36"):
+        with pytest.raises(TargetError, match=r"doesn't exist: glibc versions are 2\.x"):
+            parse_version_pair(spec, "glibc")
+    with pytest.raises(TargetError, match="musl version '1' needs a minor version too"):
+        parse_version_pair("1", "musl")
+    with pytest.raises(TargetError, match=r"doesn't exist: musl versions are 1\.x"):
+        parse_version_pair("2.0", "musl")
+    with pytest.raises(TargetError, match="glibc version '2' needs a minor version too"):
+        build_targets(["3.13"], ["linux-x86_64"], glibc="2")
+    assert parse_version_pair("2.17", "glibc") == (2, 17)
+    assert parse_version_pair("2.36", "glibc") == (2, 36)
+    assert parse_version_pair("1.1", "musl") == (1, 1)
+    assert parse_version_pair("1.2", "musl") == (1, 2)
+    assert parse_version_pair("15", "macOS") == (15, 0)

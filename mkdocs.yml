@@ -64,15 +64,18 @@ nav:
   - Home: index.md
   - Getting started: getting-started.md
   - Guides:
+      - Failed building wheel on Alpine or ARM: failed-building-wheel.md
       - Inputs: inputs.md
       - Targets: targets.md
       - Windows on ARM: windows-arm.md
       - Free-threaded Python: free-threading.md
+      - Python 3.15 readiness: python-3-15-ready.md
       - Configuration: configuration.md
       - Output: output.md
       - CI: ci.md
       - Comparing two lockfiles: diff.md
       - Recipes: recipes.md
+      - Where wheelgap differs from pip and uv: differences.md
   - Case studies:
       - Overview: case-studies/index.md
       - mitmproxy: case-studies/mitmproxy.md
@@ -91,6 +94,13 @@ nav:
       - FastMCP: case-studies/fastmcp.md
       - Pydantic AI: case-studies/pydantic-ai.md
       - LangGraph: case-studies/langgraph.md
+      - MCP Python SDK: case-studies/mcp-python-sdk.md
+      - Prefect: case-studies/prefect.md
+      - urllib3: case-studies/urllib3.md
+      - dlt: case-studies/dlt.md
+      - Home Assistant Core: case-studies/home-assistant.md
+  - Reports:
+      - Python 3.15 readiness (Nov 2026): reports/python-3-15.md
   - Integrations:
       - Python API: python-api.md
       - MCP server: mcp.md
