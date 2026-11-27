@@ -1,4 +1,3 @@
-
 # LangGraph: test dependencies on Python 3.10–3.14
 
 [LangGraph](https://github.com/langchain-ai/langgraph) is a framework for building stateful, multi-actor applications with LLMs. This case study pins revision [`3e3dbd42c5329dd404669ccd923c005c814bee3a`](https://github.com/langchain-ai/langgraph/tree/3e3dbd42c5329dd404669ccd923c005c814bee3a), uses **wheelgap 0.14.0**, and records package availability checked on **26 November 2026**.
@@ -51,7 +50,7 @@ The dependency path reported by wheelgap is:
 
 `test group → langgraph-cli → langgraph-runtime-inmem → blockbuster → forbiddenfruit`
 
-No source gap was reported for this package on Python 3.10 or 3.14 in the selected target matrix.
+`forbiddenfruit` isn't installed on Python 3.10 or 3.14 at all: `langgraph-cli` only pulls in `langgraph-runtime-inmem` on Python 3.11 to 3.13 (marker `python_full_version >= '3.11' and python_full_version < '3.14'`), so those two versions have no gap here.
 
 ## Gaps and options
 
